@@ -9,6 +9,8 @@ interface SettingsState {
   webSearchEnabled: boolean;
   selectedModel: string;
   sidebarOpen: boolean;
+  lastHomeView: string;
+  onboardingVersion: number;
   thinkEnabled: boolean;
   thinkLevel: string;
 }
@@ -21,6 +23,8 @@ type SettingsUpdate = Partial<{
   ThinkLevel: string;
   SelectedModel: string;
   SidebarOpen: boolean;
+  LastHomeView: string;
+  OnboardingVersion: number;
 }>;
 
 export function useSettings() {
@@ -50,6 +54,8 @@ export function useSettings() {
       thinkLevel: settingsData?.settings?.ThinkLevel ?? "none",
       selectedModel: settingsData?.settings?.SelectedModel ?? "",
       sidebarOpen: settingsData?.settings?.SidebarOpen ?? false,
+      lastHomeView: settingsData?.settings?.LastHomeView ?? "chat",
+      onboardingVersion: settingsData?.settings?.OnboardingVersion ?? 0,
     }),
     [settingsData?.settings],
   );

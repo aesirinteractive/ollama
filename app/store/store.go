@@ -167,9 +167,21 @@ type Settings struct {
 	// SidebarOpen indicates if the chat sidebar is open
 	SidebarOpen bool
 
+	// LastHomeView is retained for settings compatibility and resolves to chat.
+	LastHomeView string
+
+	// OnboardingVersion stores the latest onboarding flow the user has completed.
+	OnboardingVersion int
+
 	// AutoUpdateEnabled indicates if automatic updates should be downloaded
 	AutoUpdateEnabled bool
+
+	// ClaudeDesktopUsed records whether Claude Desktop has ever been connected through Ollama.
+	ClaudeDesktopUsed bool
 }
+
+// Keep in sync with CURRENT_ONBOARDING_VERSION in app/ui/app/src/lib/onboarding.ts.
+const CurrentOnboardingVersion = 1
 
 type Store struct {
 	// DBPath allows overriding the default database path (mainly for testing)
@@ -331,6 +343,16 @@ func (s *Store) migrateFromConfig(database *database) error {
 	if err := database.setHasCompletedFirstRun(hasCompleted); err != nil {
 		return fmt.Errorf("migrate first time run: %w", err)
 	}
+	if hasCompleted {
+		settings, err := database.getSettings()
+		if err != nil {
+			return fmt.Errorf("read settings for onboarding migration: %w", err)
+		}
+		settings.OnboardingVersion = CurrentOnboardingVersion
+		if err := database.setSettings(settings); err != nil {
+			return fmt.Errorf("migrate onboarding completion: %w", err)
+		}
+	}
 	slog.Info("migrated first run status from config.json", "hasCompleted", hasCompleted)
 
 	// Mark as migrated
@@ -387,6 +409,10 @@ func (s *Store) Settings() (Settings, error) {
 				settings.Models = filepath.Join(home, ".ollama", "models")
 			}
 		}
+	}
+
+	if settings.LastHomeView == "" {
+		settings.LastHomeView = "chat"
 	}
 
 	return settings, nil

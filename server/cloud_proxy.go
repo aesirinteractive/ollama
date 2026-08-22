@@ -21,15 +21,16 @@ import (
 	"github.com/ollama/ollama/auth"
 	"github.com/ollama/ollama/envconfig"
 	internalcloud "github.com/ollama/ollama/internal/cloud"
+	"github.com/ollama/ollama/openai"
 	"github.com/ollama/ollama/version"
 )
 
 const (
-	defaultCloudProxyBaseURL      = "https://ollama.com:443"
-	defaultCloudProxySigningHost  = "ollama.com"
-	cloudProxyBaseURLEnv          = "OLLAMA_CLOUD_BASE_URL"
-	legacyCloudAnthropicKey       = "legacy_cloud_anthropic_web_search"
-	cloudProxyClientVersionHeader = "X-Ollama-Client-Version"
+	defaultCloudProxyBaseURL       = "https://ollama.com:443"
+	defaultCloudProxySigningHost   = "ollama.com"
+	cloudProxyBaseURLEnv           = "OLLAMA_CLOUD_BASE_URL"
+	cloudWebSearchOrchestrationKey = "cloud_web_search_orchestration"
+	cloudProxyClientVersionHeader  = "X-Ollama-Client-Version"
 
 	// maxDecompressedBodySize limits the size of a decompressed request body
 	maxDecompressedBodySize = 20 << 20
@@ -120,14 +121,14 @@ func cloudPassthroughMiddleware(disabledOperation string) gin.HandlerFunc {
 			return
 		}
 
-		// TEMP(drifkin): keep Anthropic web search requests on the local middleware
-		// path so WebSearchAnthropicWriter can orchestrate follow-up calls.
-		if c.Request.URL.Path == "/v1/messages" {
-			if hasAnthropicWebSearchTool(body) {
-				c.Set(legacyCloudAnthropicKey, true)
-				c.Next()
-				return
-			}
+		// Keep server-side web search on the local compatibility middleware path.
+		// The converted model requests use Ollama's /api/chat contract, including
+		// for cloud models; all other cloud compatibility traffic remains raw
+		// passthrough.
+		if hasWebSearchTool(c.Request.URL.Path, body) {
+			c.Set(cloudWebSearchOrchestrationKey, true)
+			c.Next()
+			return
 		}
 
 		proxyCloudRequest(c, normalizedBody, disabledOperation)
@@ -226,7 +227,24 @@ func proxyCloudRequestWithPath(c *gin.Context, body []byte, path string, disable
 	copyProxyResponseHeaders(c.Writer.Header(), resp.Header)
 	c.Status(resp.StatusCode)
 
-	if err := copyProxyResponseBody(c.Writer, resp.Body); err != nil {
+	var bodyWriter http.ResponseWriter = c.Writer
+	var framedWriter *jsonlFramingResponseWriter
+	// TEMP(drifkin): only needed on the cloud-proxied first leg of Anthropic
+	// web_search fallback (which is a path we're removing soon). Local
+	// /v1/messages writes one JSON value per streamResponse callback directly
+	// into WebSearchAnthropicWriter, but this proxy copy loop may coalesce
+	// multiple jsonl records into one Write.  WebSearchAnthropicWriter currently
+	// unmarshals one JSON value per Write.
+	if path == "/api/chat" && resp.StatusCode == http.StatusOK && c.GetBool(cloudWebSearchOrchestrationKey) {
+		framedWriter = &jsonlFramingResponseWriter{ResponseWriter: c.Writer}
+		bodyWriter = framedWriter
+	}
+
+	err = copyProxyResponseBody(bodyWriter, resp.Body)
+	if err == nil && framedWriter != nil {
+		err = framedWriter.FlushPending()
+	}
+	if err != nil {
 		ctxErr := c.Request.Context().Err()
 		if errors.Is(err, context.Canceled) && errors.Is(ctxErr, context.Canceled) {
 			slog.Debug(
@@ -240,6 +258,7 @@ func proxyCloudRequestWithPath(c *gin.Context, body []byte, path string, disable
 		slog.Warn(
 			"cloud proxy response copy failed",
 			"path", c.Request.URL.Path,
+			"upstream_path", path,
 			"status", resp.StatusCode,
 			"request_context_canceled", ctxErr != nil,
 			"request_context_err", ctxErr,
@@ -306,8 +325,19 @@ func extractModelField(body []byte) (string, bool) {
 	return model, model != ""
 }
 
-func hasAnthropicWebSearchTool(body []byte) bool {
+func hasWebSearchTool(path string, body []byte) bool {
 	if len(body) == 0 {
+		return false
+	}
+
+	if path == "/v1/responses" {
+		var payload struct {
+			Tools []openai.ResponsesTool `json:"tools"`
+		}
+		return json.Unmarshal(body, &payload) == nil && openai.HasWebSearchTool(payload.Tools)
+	}
+
+	if path != "/v1/messages" {
 		return false
 	}
 
@@ -468,6 +498,55 @@ func copyProxyResponseBody(dst http.ResponseWriter, src io.Reader) error {
 			if err == io.EOF {
 				return nil
 			}
+			return err
+		}
+	}
+}
+
+type jsonlFramingResponseWriter struct {
+	http.ResponseWriter
+	pending []byte
+}
+
+func (w *jsonlFramingResponseWriter) Flush() {
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func (w *jsonlFramingResponseWriter) Write(p []byte) (int, error) {
+	w.pending = append(w.pending, p...)
+	if err := w.flushCompleteLines(); err != nil {
+		return len(p), err
+	}
+	return len(p), nil
+}
+
+func (w *jsonlFramingResponseWriter) FlushPending() error {
+	trailing := bytes.TrimSpace(w.pending)
+	w.pending = nil
+	if len(trailing) == 0 {
+		return nil
+	}
+
+	_, err := w.ResponseWriter.Write(trailing)
+	return err
+}
+
+func (w *jsonlFramingResponseWriter) flushCompleteLines() error {
+	for {
+		newline := bytes.IndexByte(w.pending, '\n')
+		if newline < 0 {
+			return nil
+		}
+
+		line := bytes.TrimSpace(w.pending[:newline])
+		w.pending = w.pending[newline+1:]
+		if len(line) == 0 {
+			continue
+		}
+
+		if _, err := w.ResponseWriter.Write(line); err != nil {
 			return err
 		}
 	}

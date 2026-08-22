@@ -6,7 +6,6 @@
 
 - [Generate a completion](#generate-a-completion)
 - [Generate a chat completion](#generate-a-chat-completion)
-- [Rerank documents](#rerank-documents)
 - [Create a Model](#create-a-model)
 - [List Local Models](#list-local-models)
 - [Show Model Information](#show-model-information)
@@ -17,7 +16,6 @@
 - [Generate Embeddings](#generate-embeddings)
 - [List Running Models](#list-running-models)
 - [Version](#version)
-- [Experimental: Image Generation](#image-generation-experimental)
 
 ## Conventions
 
@@ -47,7 +45,7 @@ Generate a response for a given prompt with a provided model. This is a streamin
 - `prompt`: the prompt to generate a response for
 - `suffix`: the text after the model response
 - `images`: (optional) a list of base64-encoded images (for multimodal models such as `llava`)
-- `think`: (for thinking models) should the model think before responding?
+- `think`: (for thinking models) should the model think before responding? Can be a boolean or a thinking level (`"low"`, `"medium"`, `"high"`, or `"max"`).
 
 Advanced parameters (optional):
 
@@ -59,15 +57,6 @@ Advanced parameters (optional):
 - `raw`: if `true` no formatting will be applied to the prompt. You may choose to use the `raw` parameter if you are specifying a full templated prompt in your request to the API
 - `keep_alive`: controls how long the model will stay loaded into memory following the request (default: `5m`)
 - `context` (deprecated): the context parameter returned from a previous request to `/generate`, this can be used to keep a short conversational memory
-
-Experimental image generation parameters (for image generation models only):
-
-> [!WARNING]
-> These parameters are experimental and may change in future versions.
-
-- `width`: width of the generated image in pixels
-- `height`: height of the generated image in pixels
-- `steps`: number of diffusion steps
 
 #### Structured outputs
 
@@ -399,6 +388,7 @@ curl http://localhost:11434/api/generate -d '{
     "num_keep": 5,
     "seed": 42,
     "num_predict": 100,
+    "draft_num_predict": 4,
     "top_k": 20,
     "top_p": 0.9,
     "min_p": 0.0,
@@ -504,7 +494,7 @@ Generate the next message in a chat with a provided model. This is a streaming e
 - `model`: (required) the [model name](#model-names)
 - `messages`: the messages of the chat, this can be used to keep a chat memory
 - `tools`: list of tools in JSON for the model to use if supported
-- `think`: (for thinking models) should the model think before responding?
+- `think`: (for thinking models) should the model think before responding? Can be a boolean or a thinking level (`"low"`, `"medium"`, `"high"`, or `"max"`).
 
 The `message` object has the following fields:
 
@@ -1189,7 +1179,7 @@ Create a model from:
 - a safetensors directory; or
 - a GGUF file.
 
-If you are creating a model from a safetensors directory or from a GGUF file, you must [create a blob](#create-a-blob) for each of the files and then use the file name and SHA256 digest associated with each blob in the `files` field.
+If you are creating a model from a safetensors directory or from a GGUF file, you must [push a blob](#push-a-blob) for each of the files and then use the file name and SHA256 digest associated with each blob in the `files` field.
 
 ### Parameters
 
@@ -1198,6 +1188,8 @@ If you are creating a model from a safetensors directory or from a GGUF file, yo
 - `files`: (optional) a dictionary of file names to SHA256 digests of blobs to create the model from
 - `adapters`: (optional) a dictionary of file names to SHA256 digests of blobs for LORA adapters
 - `template`: (optional) the prompt template for the model
+- `renderer`: (optional) the name of the renderer for the model
+- `parser`: (optional) the name of the parser for the model
 - `license`: (optional) a string or list of strings containing the license or licenses for the model
 - `system`: (optional) a string containing the system prompt for the model
 - `parameters`: (optional) a dictionary of parameters for the model (see [Modelfile](./modelfile.mdx#valid-parameters-and-values) for a list of parameters)
@@ -1885,7 +1877,10 @@ curl http://localhost:11434/api/version
 POST /api/rerank
 ```
 
-Rerank a list of documents based on a query.
+Rerank a list of documents based on a query. Requires a reranker model (a
+GGUF converted with rank pooling and a classification head, e.g. a
+BGE-reranker or Qwen3-Reranker conversion); reranking runs on llama-server's
+native rerank support.
 
 ### Parameters
 
@@ -1896,33 +1891,13 @@ Rerank a list of documents based on a query.
 
 ### Examples
 
-Run ollama with environment variable OLLAMA_NEW_ENGINE=1
-
-Using the Modelfile:
-```
-FROM fanyx/Qwen3-Reranker-0.6B-Q8_0
-
-TEMPLATE """<|im_start|>system
-Judge whether the Document meets the requirements based on the Query and the
-Instruct provided. Note that the answer can only be "yes" or
-"no".<|im_end|>
-<|im_start|>user
-<Instruct>: Judge whether the Document meets the requirements based on the Query and the
-Instruct provided. Note that the answer can only be "yes" or
-"no".
-<Query>: {{ .Query }}
-<Document>: {{ .Document }}<|im_end|>
-<|im_start|>assistant
-<think>\n\n</think>\n\n"""
-```
-
 #### Request
 
 ```shell
 curl http://127.0.0.1:11434/api/rerank \
 	-H "Content-Type: application/json" \
 	-d '{
-      "model": "reranker-fanyx",
+      "model": "qwen3-reranker",
       "query": "What is Ollama, the framework for machine learning things?",
       "top_n": 10,
       "documents": [
@@ -1937,9 +1912,11 @@ curl http://127.0.0.1:11434/api/rerank \
 
 #### Response
 
+Results are sorted by descending relevance; higher scores are more relevant.
+
 ```json
 {
-  "model": "reranker-fanyx-correct",
+  "model": "qwen3-reranker",
   "results": [
     {
       "index": 4,
@@ -1961,61 +1938,6 @@ curl http://127.0.0.1:11434/api/rerank \
       "index": 1,
       "relevance_score": 7.247923
     }
-  ],
-  "usage": {
-    "total_tokens": 147
-  }
-}
-```
-
-## Experimental Features
-
-### Image Generation (Experimental)
-
-> [!WARNING]
-> Image generation is experimental and may change in future versions.
-
-Image generation is now supported through the standard `/api/generate` endpoint when using image generation models. The API automatically detects when an image generation model is being used.
-
-See the [Generate a completion](#generate-a-completion) section for the full API documentation. The experimental image generation parameters (`width`, `height`, `steps`) are documented there.
-
-#### Example
-
-##### Request
-
-```shell
-curl http://localhost:11434/api/generate -d '{
-  "model": "x/z-image-turbo",
-  "prompt": "a sunset over mountains",
-  "width": 1024,
-  "height": 768
-}'
-```
-
-##### Response (streaming)
-
-Progress updates during generation:
-
-```json
-{
-  "model": "x/z-image-turbo",
-  "created_at": "2024-01-15T10:30:00.000000Z",
-  "completed": 5,
-  "total": 20,
-  "done": false
-}
-```
-
-##### Final Response
-
-```json
-{
-  "model": "x/z-image-turbo",
-  "created_at": "2024-01-15T10:30:15.000000Z",
-  "image": "iVBORw0KGgoAAAANSUhEUg...",
-  "done": true,
-  "done_reason": "stop",
-  "total_duration": 15000000000,
-  "load_duration": 2000000000
+  ]
 }
 ```

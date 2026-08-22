@@ -31,7 +31,9 @@ import (
 	"github.com/ollama/ollama/app/updater"
 	"github.com/ollama/ollama/app/version"
 	ollamaAuth "github.com/ollama/ollama/auth"
+	"github.com/ollama/ollama/cmd/launch"
 	"github.com/ollama/ollama/envconfig"
+	"github.com/ollama/ollama/manifest"
 	"github.com/ollama/ollama/types/model"
 	_ "github.com/tkrajina/typescriptify-golang-structs/typescriptify"
 )
@@ -109,8 +111,10 @@ type Server struct {
 	Dev bool
 
 	// Updater for checking and downloading updates
-	Updater             *updater.Updater
-	UpdateAvailableFunc func()
+	Updater              *updater.Updater
+	UpdateAvailableFunc  func()
+	IntegrationInstalled func(string) bool
+	ListCloudModels      func(context.Context) (*api.ListResponse, error)
 }
 
 func (s *Server) log() *slog.Logger {
@@ -155,7 +159,7 @@ func (s *Server) ollamaProxy() http.Handler {
 					return
 				}
 
-				target := envconfig.Host()
+				target := envconfig.ConnectableHost()
 				s.log().Info("configuring ollama proxy", "target", target.String())
 
 				newProxy := httputil.NewSingleHostReverseProxy(target)
@@ -193,7 +197,7 @@ func (s *Server) Handler() http.Handler {
 			if CORS() {
 				w.Header().Set("Access-Control-Allow-Origin", "*")
 				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-				w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
+				w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, User-Agent, Accept, X-Requested-With")
 				w.Header().Set("Access-Control-Allow-Credentials", "true")
 
 				// Handle preflight requests
@@ -291,6 +295,8 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /api/v1/settings", handle(s.settings))
 	mux.Handle("GET /api/v1/cloud", handle(s.getCloudSetting))
 	mux.Handle("POST /api/v1/cloud", handle(s.cloudSetting))
+	mux.Handle("GET /api/v1/models/cloud", handle(s.getCloudModels))
+	mux.Handle("GET /api/v1/integrations", handle(s.getIntegrationStatuses))
 
 	// Ollama proxy endpoints
 	ollamaProxy := s.ollamaProxy()
@@ -301,6 +307,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("HEAD /api/version", ollamaProxy)
 	mux.Handle("POST /api/me", ollamaProxy)
 	mux.Handle("POST /api/signout", ollamaProxy)
+	mux.Handle("GET /api/experimental/model-recommendations", ollamaProxy)
 
 	// React app - catch all non-API routes and serve the React app
 	mux.Handle("GET /", s.appHandler())
@@ -312,13 +319,81 @@ func (s *Server) Handler() http.Handler {
 	return mux
 }
 
+func (s *Server) getIntegrationStatuses(w http.ResponseWriter, _ *http.Request) error {
+	isInstalled := s.IntegrationInstalled
+	if isInstalled == nil {
+		isInstalled = launch.IsIntegrationInstalled
+	}
+
+	type integrationStatus struct {
+		ID          string `json:"id"`
+		Name        string `json:"name"`
+		Description string `json:"description"`
+		Installed   *bool  `json:"installed,omitempty"`
+		Action      string `json:"action"`
+		Command     string `json:"command,omitempty"`
+	}
+
+	infos := launch.ListIntegrationInfos()
+	statuses := make([]integrationStatus, 0, len(infos)+2)
+	claudeDesktopInstalled := isInstalled("claude-desktop")
+	statuses = append(statuses, integrationStatus{
+		ID:          "claude-desktop",
+		Name:        "Claude",
+		Description: "Use Ollama models in Claude Desktop",
+		Installed:   &claudeDesktopInstalled,
+		Action:      "connect",
+	})
+
+	byName := make(map[string]launch.IntegrationInfo, len(infos))
+	for _, info := range infos {
+		byName[info.Name] = info
+	}
+	seen := map[string]bool{"chatgpt": true}
+	launcherMenuOrder := []string{"claude", "codex", "openclaw", "opencode", "droid", "pi", "cline"}
+	orderedInfos := make([]launch.IntegrationInfo, 0, len(infos))
+	for _, name := range launcherMenuOrder {
+		if info, ok := byName[name]; ok {
+			orderedInfos = append(orderedInfos, info)
+			seen[name] = true
+		}
+	}
+	for _, info := range infos {
+		if !seen[info.Name] {
+			orderedInfos = append(orderedInfos, info)
+		}
+	}
+
+	for _, info := range orderedInfos {
+		installed := isInstalled(info.Name)
+		statuses = append(statuses, integrationStatus{
+			ID:          info.Name,
+			Name:        info.DisplayName,
+			Description: info.Description,
+			Installed:   &installed,
+			Action:      "copy",
+			Command:     "ollama launch " + info.Name,
+		})
+	}
+
+	statuses = append(statuses, integrationStatus{
+		ID:          "terminal",
+		Name:        "Terminal",
+		Description: "Run local models from your terminal",
+		Action:      "copy",
+		Command:     "ollama",
+	})
+
+	return json.NewEncoder(w).Encode(statuses)
+}
+
 // handleError renders appropriate error responses based on request type
 func (s *Server) handleError(w http.ResponseWriter, e error) {
 	// Preserve CORS headers for API requests
 	if CORS() {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, User-Agent, Accept, X-Requested-With")
 		w.Header().Set("Access-Control-Allow-Credentials", "true")
 	}
 
@@ -341,8 +416,18 @@ func (t *userAgentTransport) RoundTrip(req *http.Request) (*http.Response, error
 
 // httpClient returns an HTTP client that automatically adds the User-Agent header
 func (s *Server) httpClient() *http.Client {
+	return userAgentHTTPClient(10 * time.Second)
+}
+
+// inferenceClient uses almost the same HTTP client, but without a timeout so
+// long requests aren't truncated
+func (s *Server) inferenceClient() *api.Client {
+	return api.NewClient(envconfig.Host(), userAgentHTTPClient(0))
+}
+
+func userAgentHTTPClient(timeout time.Duration) *http.Client {
 	return &http.Client{
-		Timeout: 10 * time.Second,
+		Timeout: timeout,
 		Transport: &userAgentTransport{
 			base: http.DefaultTransport,
 		},
@@ -562,6 +647,18 @@ func (s *Server) getError(err error) responses.ErrorEvent {
 	}
 }
 
+func userMessageText(messages []store.Message) string {
+	var b strings.Builder
+	for _, message := range messages {
+		if message.Role != "user" {
+			continue
+		}
+		b.WriteString(message.Content)
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
 func (s *Server) browserState(chat *store.Chat) (*responses.BrowserStateData, bool) {
 	if len(chat.BrowserState) > 0 {
 		var st responses.BrowserStateData
@@ -720,11 +817,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) error {
 	_, cancelLoading := context.WithCancel(ctx)
 	loading := false
 
-	c, err := api.ClientFromEnvironment()
-	if err != nil {
-		cancelLoading()
-		return err
-	}
+	c := s.inferenceClient()
 
 	// Check if the model exists locally by trying to show it
 	// TODO (jmorganca): skip this round trip and instead just act
@@ -831,6 +924,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) error {
 	// Note: Skip agent/tools mode if user has attachments, as the agent doesn't handle file attachments properly
 	registry := tools.NewRegistry()
 	var browser *tools.Browser
+	ctx = tools.WithAllowedDirectURLs(ctx, userMessageText(chat.Messages))
 
 	if !hasAttachments {
 		WebSearchEnabled := req.WebSearch != nil && *req.WebSearch
@@ -1443,9 +1537,25 @@ func (s *Server) settings(w http.ResponseWriter, r *http.Request) error {
 		return fmt.Errorf("failed to load settings: %w", err)
 	}
 
-	var settings store.Settings
-	if err := json.NewDecoder(r.Body).Decode(&settings); err != nil {
+	var request struct {
+		store.Settings
+		OnboardingVersion *int
+		ClaudeDesktopUsed *bool
+	}
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 		return fmt.Errorf("invalid request body: %w", err)
+	}
+
+	settings := request.Settings
+	if request.OnboardingVersion == nil {
+		settings.OnboardingVersion = old.OnboardingVersion
+	} else {
+		settings.OnboardingVersion = *request.OnboardingVersion
+	}
+	if request.ClaudeDesktopUsed == nil {
+		settings.ClaudeDesktopUsed = old.ClaudeDesktopUsed
+	} else {
+		settings.ClaudeDesktopUsed = *request.ClaudeDesktopUsed
 	}
 
 	if err := s.Store.SetSettings(settings); err != nil {
@@ -1516,6 +1626,58 @@ func (s *Server) writeCloudStatus(w http.ResponseWriter) error {
 	})
 }
 
+func (s *Server) getCloudModels(w http.ResponseWriter, r *http.Request) error {
+	w.Header().Set("Content-Type", "application/json")
+	disabled, _, err := s.Store.CloudStatus()
+	if err != nil {
+		return fmt.Errorf("failed to load cloud status: %w", err)
+	}
+	if disabled {
+		return json.NewEncoder(w).Encode(api.ListResponse{Models: []api.ListModelResponse{}})
+	}
+
+	list := s.ListCloudModels
+	if list == nil {
+		list = s.listCloudModels
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+	models, err := list(ctx)
+	if err != nil {
+		var authErr api.AuthorizationError
+		if errors.As(err, &authErr) && (authErr.StatusCode == http.StatusUnauthorized || authErr.StatusCode == http.StatusForbidden) {
+			return json.NewEncoder(w).Encode(api.ListResponse{Models: []api.ListModelResponse{}})
+		}
+		return fmt.Errorf("failed to list cloud models: %w", err)
+	}
+	if models == nil {
+		models = &api.ListResponse{Models: []api.ListModelResponse{}}
+	}
+
+	return json.NewEncoder(w).Encode(models)
+}
+
+func (s *Server) listCloudModels(ctx context.Context) (*api.ListResponse, error) {
+	resp, err := s.doSelfSigned(ctx, http.MethodGet, "/api/tags")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return nil, api.AuthorizationError{StatusCode: resp.StatusCode}
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("ollama.com/api/tags returned %s", resp.Status)
+	}
+
+	var models api.ListResponse
+	if err := json.NewDecoder(resp.Body).Decode(&models); err != nil {
+		return nil, fmt.Errorf("failed to parse cloud models: %w", err)
+	}
+	return &models, nil
+}
+
 func (s *Server) getInferenceCompute(w http.ResponseWriter, r *http.Request) error {
 	ctx, cancel := context.WithTimeout(r.Context(), 500*time.Millisecond)
 	defer cancel()
@@ -1572,9 +1734,18 @@ func (s *Server) modelUpstream(w http.ResponseWriter, r *http.Request) error {
 		return json.NewEncoder(w).Encode(response)
 	}
 
+	n := model.ParseName(req.Model)
+	stale := true
+	if m, err := manifest.ParseNamedManifest(n); err == nil {
+		if m.Digest() == digest {
+			stale = false
+		} else if pushTime > 0 && m.FileInfo().ModTime().Unix() >= pushTime {
+			stale = false
+		}
+	}
+
 	response := responses.ModelUpstreamResponse{
-		Digest:   digest,
-		PushTime: pushTime,
+		Stale: stale,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -1671,7 +1842,6 @@ func ptr[T any](v T) *T { return &v }
 func supportsBrowserTools(model string) bool {
 	return strings.HasPrefix(strings.ToLower(model), "gpt-oss")
 }
-
 
 // buildChatRequest converts store.Chat to api.ChatRequest
 func (s *Server) buildChatRequest(chat *store.Chat, model string, think any, availableTools []map[string]any) (*api.ChatRequest, error) {

@@ -81,6 +81,62 @@ func TestStore(t *testing.T) {
 		}
 	})
 
+	t.Run("settings default home view is chat", func(t *testing.T) {
+		loaded, err := s.Settings()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if loaded.LastHomeView != "chat" {
+			t.Fatalf("expected default LastHomeView to be chat, got %q", loaded.LastHomeView)
+		}
+	})
+
+	t.Run("settings empty home view falls back to chat", func(t *testing.T) {
+		if err := s.SetSettings(Settings{LastHomeView: ""}); err != nil {
+			t.Fatal(err)
+		}
+
+		loaded, err := s.Settings()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if loaded.LastHomeView != "chat" {
+			t.Fatalf("expected empty LastHomeView to fall back to chat, got %q", loaded.LastHomeView)
+		}
+	})
+
+	t.Run("settings retired home view falls back to chat", func(t *testing.T) {
+		if err := s.SetSettings(Settings{LastHomeView: "claude-desktop"}); err != nil {
+			t.Fatal(err)
+		}
+
+		loaded, err := s.Settings()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if loaded.LastHomeView != "chat" {
+			t.Fatalf("expected retired LastHomeView to fall back to chat, got %q", loaded.LastHomeView)
+		}
+	})
+
+	t.Run("settings integration home view falls back to chat", func(t *testing.T) {
+		if err := s.SetSettings(Settings{LastHomeView: "codex-app"}); err != nil {
+			t.Fatal(err)
+		}
+
+		loaded, err := s.Settings()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if loaded.LastHomeView != "chat" {
+			t.Fatalf("expected integration LastHomeView to fall back to chat, got %q", loaded.LastHomeView)
+		}
+	})
+
 	t.Run("window size", func(t *testing.T) {
 		if err := s.SetWindowSize(1024, 768); err != nil {
 			t.Fatal(err)
@@ -169,6 +225,58 @@ func TestStore(t *testing.T) {
 			t.Fatalf("expected 1 chat after deletion, got %d", len(chats))
 		}
 	})
+}
+
+func TestOnboardingVersionRoundTrip(t *testing.T) {
+	s, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	settings, err := s.Settings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settings.OnboardingVersion != 0 {
+		t.Fatalf("expected onboarding version 0 by default, got %d", settings.OnboardingVersion)
+	}
+
+	settings.OnboardingVersion = 1
+	if err := s.SetSettings(settings); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := s.Settings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.OnboardingVersion != 1 {
+		t.Fatalf("expected onboarding version 1, got %d", loaded.OnboardingVersion)
+	}
+}
+
+func TestClaudeDesktopUsedRoundTrip(t *testing.T) {
+	s, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	settings, err := s.Settings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settings.ClaudeDesktopUsed {
+		t.Fatal("expected Claude Desktop history to be false by default")
+	}
+
+	settings.ClaudeDesktopUsed = true
+	if err := s.SetSettings(settings); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := s.Settings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !loaded.ClaudeDesktopUsed {
+		t.Fatal("expected Claude Desktop history to persist")
+	}
 }
 
 // setupTestStore creates a temporary store for testing

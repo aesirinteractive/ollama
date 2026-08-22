@@ -26,35 +26,36 @@ import (
 	"github.com/ollama/ollama/format"
 	"github.com/ollama/ollama/llm"
 	"github.com/ollama/ollama/ml"
-	"github.com/ollama/ollama/x/imagegen"
 	"github.com/ollama/ollama/x/imagegen/manifest"
 )
 
 // Client wraps an MLX runner subprocess to implement llm.LlamaServer for LLM models.
 type Client struct {
-	port          int
-	modelName     string
-	contextLength atomic.Int64
-	memory        atomic.Uint64
-	done          chan error
-	client        *http.Client
-	lastErr       string
-	lastErrLock   sync.Mutex
-	mu            sync.Mutex
-	cmd           *exec.Cmd
+	port              int
+	modelName         string
+	contextLength     atomic.Int64
+	softContextLength int // recommended limit to avoid poor performance
+	memory            atomic.Uint64
+	done              chan struct{}
+	doneErr           error // valid after done is closed
+	client            *http.Client
+	status            *llm.StatusWriter
+	mu                sync.Mutex
+	cmd               *exec.Cmd
 }
 
 // NewClient prepares a new MLX runner client for LLM models.
 // The subprocess is not started until Load() is called.
-func NewClient(modelName string) (*Client, error) {
-	if err := imagegen.CheckPlatformSupport(); err != nil {
+func NewClient(modelName string, softContextLength int) (*Client, error) {
+	if err := checkPlatformSupport(); err != nil {
 		return nil, err
 	}
 
 	c := &Client{
-		modelName: modelName,
-		done:      make(chan error, 1),
-		client:    &http.Client{Timeout: 10 * time.Minute},
+		modelName:         modelName,
+		softContextLength: softContextLength,
+		done:              make(chan struct{}),
+		client:            http.DefaultClient,
 	}
 
 	modelManifest, err := manifest.LoadManifest(modelName)
@@ -66,15 +67,23 @@ func NewClient(modelName string) (*Client, error) {
 	return c, nil
 }
 
-func (c *Client) getLastErr() string {
-	c.lastErrLock.Lock()
-	defer c.lastErrLock.Unlock()
-	return c.lastErr
+func checkPlatformSupport() error {
+	switch runtime.GOOS {
+	case "darwin":
+		if runtime.GOARCH != "arm64" {
+			return fmt.Errorf("MLX on macOS requires Apple Silicon (arm64), got %s", runtime.GOARCH)
+		}
+		return nil
+	case "linux", "windows":
+		return nil
+	default:
+		return fmt.Errorf("MLX is not supported on %s", runtime.GOOS)
+	}
 }
 
 // WaitUntilRunning waits for the subprocess to be ready.
 func (c *Client) WaitUntilRunning(ctx context.Context) error {
-	timeout := time.After(2 * time.Minute)
+	timeout := time.After(envconfig.LoadTimeout())
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -82,16 +91,14 @@ func (c *Client) WaitUntilRunning(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case err := <-c.done:
-			errMsg := c.getLastErr()
-			if errMsg != "" {
-				return fmt.Errorf("mlx runner failed: %s (exit: %v)", errMsg, err)
+		case <-c.done:
+			if msg := c.status.LastError(); msg != "" {
+				return fmt.Errorf("mlx runner failed: %s (exit: %v)", msg, c.doneErr)
 			}
-			return fmt.Errorf("mlx runner exited unexpectedly: %w", err)
+			return fmt.Errorf("mlx runner exited unexpectedly: %w", c.doneErr)
 		case <-timeout:
-			errMsg := c.getLastErr()
-			if errMsg != "" {
-				return fmt.Errorf("timeout waiting for mlx runner: %s", errMsg)
+			if msg := c.status.LastError(); msg != "" {
+				return fmt.Errorf("timeout waiting for mlx runner: %s", msg)
 			}
 			return errors.New("timeout waiting for mlx runner to start")
 		case <-ticker.C:
@@ -103,20 +110,12 @@ func (c *Client) WaitUntilRunning(ctx context.Context) error {
 	}
 }
 
-// completionRequest is a properly-tagged version of llm.CompletionRequest for JSON serialization.
-type completionRequest struct {
-	Prompt  string          `json:"prompt"`
-	Options *completionOpts `json:"options,omitempty"`
-}
-
-type completionOpts struct {
-	Temperature     float32 `json:"temperature,omitempty"`
-	TopP            float32 `json:"top_p,omitempty"`
-	MinP            float32 `json:"min_p,omitempty"`
-	TopK            int     `json:"top_k,omitempty"`
-	RepeatLastN     int     `json:"repeat_last_n,omitempty"`
-	PresencePenalty float32 `json:"presence_penalty,omitempty"`
-	NumPredict      int     `json:"num_predict,omitempty"`
+type CompletionRequest struct {
+	Prompt      string
+	Media       []llm.MediaData
+	Options     api.Options
+	Logprobs    bool
+	TopLogprobs int
 }
 
 type CompletionResponse struct {
@@ -128,6 +127,8 @@ type CompletionResponse struct {
 	PromptEvalDuration time.Duration
 	EvalCount          int
 	EvalDuration       time.Duration
+
+	Logprobs []llm.Logprob
 
 	Error *api.StatusError
 }
@@ -153,19 +154,14 @@ func (c *Client) Close() error {
 
 // Completion implements llm.LlamaServer.
 func (c *Client) Completion(ctx context.Context, req llm.CompletionRequest, fn func(llm.CompletionResponse)) error {
-	creq := completionRequest{
-		Prompt: req.Prompt,
+	creq := CompletionRequest{
+		Prompt:      req.Prompt,
+		Media:       req.Media,
+		Logprobs:    req.Logprobs,
+		TopLogprobs: req.TopLogprobs,
 	}
 	if req.Options != nil {
-		creq.Options = &completionOpts{
-			Temperature:     req.Options.Temperature,
-			TopP:            req.Options.TopP,
-			MinP:            req.Options.MinP,
-			TopK:            req.Options.TopK,
-			RepeatLastN:     req.Options.RepeatLastN,
-			PresencePenalty: req.Options.PresencePenalty,
-			NumPredict:      req.Options.NumPredict,
-		}
+		creq.Options = *req.Options
 	}
 
 	body, err := json.Marshal(creq)
@@ -182,13 +178,16 @@ func (c *Client) Completion(ctx context.Context, req llm.CompletionRequest, fn f
 
 	resp, err := c.client.Do(httpReq)
 	if err != nil {
+		if errMsg := c.status.LastError(); errMsg != "" {
+			return fmt.Errorf("mlx runner failed: %s", errMsg)
+		}
 		return err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("%s", strings.TrimSpace(string(respBody)))
+		return api.StatusError{StatusCode: resp.StatusCode, ErrorMessage: strings.TrimSpace(string(respBody))}
 	}
 
 	scanner := bufio.NewScanner(resp.Body)
@@ -211,6 +210,7 @@ func (c *Client) Completion(ctx context.Context, req llm.CompletionRequest, fn f
 			PromptEvalDuration: raw.PromptEvalDuration,
 			EvalCount:          raw.EvalCount,
 			EvalDuration:       raw.EvalDuration,
+			Logprobs:           raw.Logprobs,
 		}
 
 		fn(cresp)
@@ -219,11 +219,32 @@ func (c *Client) Completion(ctx context.Context, req llm.CompletionRequest, fn f
 		}
 	}
 
-	return scanner.Err()
+	if err := scanner.Err(); err != nil {
+		if errMsg := c.status.LastError(); errMsg != "" {
+			return fmt.Errorf("mlx runner failed: %s", errMsg)
+		}
+		return err
+	}
+	return nil
+}
+
+func (c *Client) Chat(ctx context.Context, req llm.ChatRequest, fn func(llm.ChatResponse)) error {
+	return errors.New("MLX runner does not support native llama-server chat")
+}
+
+func (c *Client) ApplyChatTemplate(ctx context.Context, req llm.ChatRequest) (string, error) {
+	return "", errors.New("MLX runner does not support native llama-server chat templates")
 }
 
 func (c *Client) ContextLength() int {
 	return int(c.contextLength.Load())
+}
+
+func (c *Client) reportedContextLength(modelContextLength int) int {
+	if c.softContextLength > 0 && (modelContextLength == 0 || c.softContextLength < modelContextLength) {
+		return c.softContextLength
+	}
+	return modelContextLength
 }
 
 // Detokenize implements llm.LlamaServer.
@@ -348,24 +369,29 @@ func (c *Client) Load(ctx context.Context, _ ml.SystemInfo, gpus []ml.DeviceInfo
 		slog.Debug("mlx subprocess library path", libPathEnvVar, pathEnvVal)
 	}
 
+	// Point MLX's JIT compiler at our bundled CUDA runtime headers.
+	// MLX resolves headers via $CUDA_PATH/include/*.h (and checks CUDA_HOME first).
+	// Always use bundled headers to avoid version mismatches with any
+	// system-installed CUDA toolkit.
+	if mlxDirs, err := filepath.Glob(filepath.Join(ml.LibOllamaPath, "mlx_cuda_*")); err == nil {
+		for _, d := range mlxDirs {
+			if _, err := os.Stat(filepath.Join(d, "include")); err == nil {
+				setEnv(cmd, "CUDA_PATH", d)
+				setEnv(cmd, "CUDA_HOME", d)
+				slog.Debug("mlx subprocess CUDA headers", "CUDA_PATH", d)
+				break
+			}
+		}
+	}
+
 	c.cmd = cmd
 
-	// Forward subprocess stdout/stderr to server logs
-	stdout, _ := cmd.StdoutPipe()
-	stderr, _ := cmd.StderrPipe()
-	go func() {
-		io.Copy(os.Stderr, stdout) //nolint:errcheck
-	}()
-	go func() {
-		scanner := bufio.NewScanner(stderr)
-		for scanner.Scan() {
-			line := scanner.Text()
-			fmt.Fprintln(os.Stderr, line)
-			c.lastErrLock.Lock()
-			c.lastErr = line
-			c.lastErrLock.Unlock()
-		}
-	}()
+	status := llm.NewStatusWriter(os.Stderr)
+	c.status = status
+	// os/exec serializes Write calls when shared, which keeps the status writer
+	// from seeing concurrent stdout/stderr fragments.
+	cmd.Stdout = status
+	cmd.Stderr = status
 
 	slog.Info("starting mlx runner subprocess", "model", c.modelName, "port", c.port)
 	if err := cmd.Start(); err != nil {
@@ -374,8 +400,8 @@ func (c *Client) Load(ctx context.Context, _ ml.SystemInfo, gpus []ml.DeviceInfo
 
 	// Reap subprocess when it exits
 	go func() {
-		err := cmd.Wait()
-		c.done <- err
+		c.doneErr = cmd.Wait()
+		close(c.done)
 	}()
 
 	return nil, nil
@@ -424,7 +450,7 @@ func (c *Client) Ping(ctx context.Context) error {
 		return err
 	}
 
-	c.contextLength.Store(int64(status.ContextLength))
+	c.contextLength.Store(int64(c.reportedContextLength(status.ContextLength)))
 	c.memory.Store(status.Memory)
 
 	return nil
@@ -472,3 +498,16 @@ func (c *Client) VRAMByGPU(id ml.DeviceID) uint64 {
 }
 
 var _ llm.LlamaServer = (*Client)(nil)
+
+// setEnv sets or replaces an environment variable in cmd.Env.
+func setEnv(cmd *exec.Cmd, key, value string) {
+	entry := key + "=" + value
+	prefix := strings.ToUpper(key + "=")
+	for i, e := range cmd.Env {
+		if strings.HasPrefix(strings.ToUpper(e), prefix) {
+			cmd.Env[i] = entry
+			return
+		}
+	}
+	cmd.Env = append(cmd.Env, entry)
+}

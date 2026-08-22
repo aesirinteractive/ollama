@@ -13,6 +13,13 @@ type LinearLayer interface {
 	OutputDim() int32
 }
 
+// EmbeddingLayer is an interface for embedding layers that can also expose a
+// tied-output projection when the model reuses embedding weights as the LM head.
+type EmbeddingLayer interface {
+	Forward(indices *mlx.Array) *mlx.Array
+	AsLinear() LinearLayer
+}
+
 // Conv1d applies 1D convolution over NLC input.
 type Conv1d struct {
 	Weight   *mlx.Array
@@ -54,6 +61,9 @@ type Linear struct {
 }
 
 func NewLinear(weight *mlx.Array, bias *mlx.Array) *Linear {
+	if bias != nil && bias.Valid() && bias.DType() != weight.DType() {
+		bias = bias.AsType(weight.DType())
+	}
 	return &Linear{Weight: weight, Bias: bias}
 }
 
@@ -71,13 +81,14 @@ func (l *Linear) OutputDim() int32 {
 
 // QuantizedLinear applies an affine transformation using quantized weights.
 type QuantizedLinear struct {
-	Weight    *mlx.Array // Quantized weight data
-	Scales    *mlx.Array // Scale factors for dequantization
-	QBiases   *mlx.Array // Quantization biases (nil for nvfp4)
-	Bias      *mlx.Array // Layer bias [output_dims] or nil
-	GroupSize int
-	Bits      int
-	Mode      string
+	Weight      *mlx.Array // Quantized weight data
+	Scales      *mlx.Array // Scale factors for dequantization
+	QBiases     *mlx.Array // Quantization biases (nil for nvfp4)
+	Bias        *mlx.Array // Layer bias [output_dims] or nil
+	GlobalScale *mlx.Array // Per-tensor or per-row global scale for double-scale nvfp4 (nil for standard)
+	GroupSize   int
+	Bits        int
+	Mode        string
 }
 
 func NewQuantizedLinear(weight *mlx.Array, bias *mlx.Array, groupSize, bits int, mode string) *QuantizedLinear {
@@ -86,6 +97,9 @@ func NewQuantizedLinear(weight *mlx.Array, bias *mlx.Array, groupSize, bits int,
 		mlx.Eval(qw, scales, qbiases)
 	} else {
 		mlx.Eval(qw, scales)
+	}
+	if bias != nil && bias.Valid() && bias.DType() != weight.DType() {
+		bias = bias.AsType(weight.DType())
 	}
 	return &QuantizedLinear{
 		Weight:    qw,
@@ -98,10 +112,30 @@ func NewQuantizedLinear(weight *mlx.Array, bias *mlx.Array, groupSize, bits int,
 	}
 }
 
+var quantizedLinearOutputScale = mlx.Compile2(
+	"QuantizedLinearOutputScale",
+	func(out, scale *mlx.Array) *mlx.Array {
+		return mlx.Mul(out, scale).AsType(out.DType())
+	},
+	mlx.Shapeless(),
+)
+
 func (ql *QuantizedLinear) Forward(x *mlx.Array) *mlx.Array {
 	out := mlx.QuantizedMatmul(x, ql.Weight, ql.Scales, ql.QBiases, true, ql.GroupSize, ql.Bits, ql.Mode)
+	if ql.GlobalScale != nil {
+		// Double-scale nvfp4 (e.g., NVIDIA ModelOpt): standard quantized_matmul
+		// followed by global_scale multiply. The global_scale is F32, per-tensor
+		// (weight_scale_2 in NVIDIA's format) or per-row.
+		// TODO: switch to a fused double-scale matmul once MLX has kernel
+		// coverage for this path.
+		out = quantizedLinearOutputScale(out, ql.GlobalScale)
+	}
 	if ql.Bias != nil && ql.Bias.Valid() {
-		out = out.Add(ql.Bias)
+		bias := ql.Bias
+		if bias.DType() != out.DType() {
+			bias = bias.AsType(out.DType())
+		}
+		out = out.Add(bias)
 	}
 	return out
 }
@@ -140,6 +174,44 @@ func (e *Embedding) Forward(indices *mlx.Array) *mlx.Array {
 	return e.Weight.TakeAxis(indices, 0)
 }
 
+func (e *Embedding) AsLinear() LinearLayer {
+	return NewLinear(e.Weight, nil)
+}
+
+// QuantizedEmbedding performs row-wise embedding lookup from affine/nvfp4/etc.
+// packed weights and dequantizes only the selected rows.
+type QuantizedEmbedding struct {
+	Weight      *mlx.Array
+	Scales      *mlx.Array
+	QBiases     *mlx.Array
+	GlobalScale *mlx.Array // Per-tensor global scale for double-scale nvfp4 (nil for standard)
+	GroupSize   int
+	Bits        int
+	Mode        string
+}
+
+func (qe *QuantizedEmbedding) Forward(indices *mlx.Array) *mlx.Array {
+	weight := qe.Weight.TakeAxis(indices, 0)
+	scales := qe.Scales.TakeAxis(indices, 0)
+	var qbiases *mlx.Array
+	if qe.QBiases != nil && qe.QBiases.Valid() {
+		qbiases = qe.QBiases.TakeAxis(indices, 0)
+	}
+	return mlx.Dequantize(weight, scales, qbiases, qe.GroupSize, qe.Bits, qe.Mode, qe.GlobalScale)
+}
+
+func (qe *QuantizedEmbedding) AsLinear() LinearLayer {
+	return &QuantizedLinear{
+		Weight:      qe.Weight,
+		Scales:      qe.Scales,
+		QBiases:     qe.QBiases,
+		GlobalScale: qe.GlobalScale,
+		GroupSize:   qe.GroupSize,
+		Bits:        qe.Bits,
+		Mode:        qe.Mode,
+	}
+}
+
 // LayerNorm represents a standard layer normalization layer (with bias).
 type LayerNorm struct {
 	Weight *mlx.Array
@@ -174,7 +246,6 @@ func (ml *MultiLinear) Forward(x *mlx.Array) *mlx.Array {
 	wT := ml.Weight.Transpose(0, 2, 1)
 	return x.Matmul(wT)
 }
-
 
 // ApplyCausalMask applies causal (lower triangular) mask to attention scores.
 func ApplyCausalMask(scores *mlx.Array) *mlx.Array {

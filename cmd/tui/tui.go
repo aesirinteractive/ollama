@@ -45,21 +45,10 @@ type menuItem struct {
 	isOthers    bool
 }
 
-var mainMenuItems = []menuItem{
-	{
-		title:       "Run a model",
-		description: "Start an interactive chat with a model",
-		isRunModel:  true,
-	},
-	{
-		integration: "claude",
-	},
-	{
-		integration: "codex",
-	},
-	{
-		integration: "openclaw",
-	},
+var runModelMenuItem = menuItem{
+	title:       "Chat, Code, & Work",
+	description: "Chat with models, code, search the web, and delegate real work",
+	isRunModel:  true,
 }
 
 var othersMenuItem = menuItem{
@@ -67,6 +56,10 @@ var othersMenuItem = menuItem{
 	description: "Show additional integrations",
 	isOthers:    true,
 }
+
+// launcherMenuIntegrations defines the integrations pinned to the root menu.
+// Additional visible integrations are available through More in registry order.
+var launcherMenuIntegrations = []string{"claude", "opencode", "hermes", "openclaw"}
 
 type model struct {
 	state      *launch.LauncherState
@@ -102,20 +95,14 @@ func shouldExpandOthers(state *launch.LauncherState) bool {
 }
 
 func buildMenuItems(state *launch.LauncherState, showOthers bool) []menuItem {
-	items := make([]menuItem, 0, len(mainMenuItems)+1)
-	for _, item := range mainMenuItems {
-		if item.integration == "" {
-			items = append(items, item)
-			continue
-		}
-		if integrationState, ok := state.Integrations[item.integration]; ok {
-			items = append(items, integrationMenuItem(integrationState))
-		}
-	}
+	items := []menuItem{runModelMenuItem}
+	items = append(items, launcherIntegrationItems(state)...)
 
-	if showOthers {
-		items = append(items, otherIntegrationItems(state)...)
-	} else {
+	otherItems := otherIntegrationItems(state)
+	switch {
+	case showOthers:
+		items = append(items, otherItems...)
+	case len(otherItems) > 0:
 		items = append(items, othersMenuItem)
 	}
 
@@ -134,14 +121,33 @@ func integrationMenuItem(state launch.LauncherIntegrationState) menuItem {
 	}
 }
 
-func otherIntegrationItems(state *launch.LauncherState) []menuItem {
-	pinned := map[string]bool{
-		"claude":   true,
-		"codex":    true,
-		"openclaw": true,
+func launcherIntegrationItems(state *launch.LauncherState) []menuItem {
+	if state == nil {
+		return nil
 	}
 
-	var items []menuItem
+	items := make([]menuItem, 0, len(launcherMenuIntegrations))
+	for _, name := range launcherMenuIntegrations {
+		integrationState, ok := state.Integrations[name]
+		if !ok {
+			continue
+		}
+		items = append(items, integrationMenuItem(integrationState))
+	}
+	return items
+}
+
+func otherIntegrationItems(state *launch.LauncherState) []menuItem {
+	if state == nil {
+		return nil
+	}
+
+	pinned := make(map[string]bool, len(launcherMenuIntegrations))
+	for _, name := range launcherMenuIntegrations {
+		pinned[name] = true
+	}
+
+	items := make([]menuItem, 0, len(state.Integrations))
 	for _, info := range launch.ListIntegrationInfos() {
 		if pinned[info.Name] {
 			continue
@@ -153,6 +159,10 @@ func otherIntegrationItems(state *launch.LauncherState) []menuItem {
 		items = append(items, integrationMenuItem(integrationState))
 	}
 	return items
+}
+
+func primaryMenuItemCount(state *launch.LauncherState) int {
+	return 1 + len(launcherIntegrationItems(state))
 }
 
 func initialCursor(state *launch.LauncherState, items []menuItem) int {
@@ -190,7 +200,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.cursor > 0 {
 				m.cursor--
 			}
-			if m.showOthers && m.cursor < len(mainMenuItems) {
+			if m.showOthers && m.cursor < primaryMenuItemCount(m.state) {
 				m.showOthers = false
 				m.items = buildMenuItems(m.state, false)
 				m.cursor = min(m.cursor, len(m.items)-1)
@@ -235,7 +245,7 @@ func (m model) selectableItem(item menuItem) bool {
 	if item.isRunModel {
 		return true
 	}
-	if item.integration == "" || item.isOthers {
+	if item.integration == "" {
 		return false
 	}
 	state, ok := m.state.Integrations[item.integration]
@@ -243,7 +253,7 @@ func (m model) selectableItem(item menuItem) bool {
 }
 
 func (m model) changeableItem(item menuItem) bool {
-	if item.integration == "" || item.isOthers {
+	if item.integration == "" {
 		return false
 	}
 	state, ok := m.state.Integrations[item.integration]
@@ -288,9 +298,7 @@ func (m model) renderMenuItem(index int, item menuItem) string {
 			style = menuSelectedItemStyle
 		}
 	} else if item.isOthers {
-		if m.cursor == index {
-			style = menuSelectedItemStyle
-		}
+		// More immediately expands when reached, so it always uses the default style.
 	} else {
 		integrationState := m.state.Integrations[item.integration]
 		if !integrationState.Selectable {

@@ -4,14 +4,13 @@ import (
 	"math"
 	"testing"
 
+	"github.com/ollama/ollama/x/internal/mlxtest"
 	"github.com/ollama/ollama/x/mlxrunner/mlx"
 )
 
 func skipIfNoMLX(t *testing.T) {
 	t.Helper()
-	if err := mlx.CheckInit(); err != nil {
-		t.Skipf("MLX not available: %v", err)
-	}
+	mlxtest.Setup(t)
 }
 
 func approxEqual(a, b, tol float32) bool {
@@ -142,5 +141,83 @@ func TestLayerNormDefaultEps(t *testing.T) {
 		if !approxEqual(d0[i], dE[i], 1e-6) {
 			t.Errorf("index %d: Eps=0 gave %.6f, Eps=1e-5 gave %.6f", i, d0[i], dE[i])
 		}
+	}
+}
+
+func TestQuantizedLinearMXFP4MatchesDequantizedWeight(t *testing.T) {
+	skipIfNoMLX(t)
+
+	weightVals := make([]float32, 3*32)
+	for i := range weightVals {
+		weightVals[i] = float32((i%11)-5) / 7
+	}
+	inputVals := make([]float32, 2*32)
+	for i := range inputVals {
+		inputVals[i] = float32((i%7)-3) / 5
+	}
+
+	weight := mlx.FromValues(weightVals, 3, 32).AsType(mlx.DTypeBFloat16)
+	input := mlx.FromValues(inputVals, 2, 32).AsType(mlx.DTypeBFloat16)
+	mlx.Eval(weight, input)
+
+	ql := NewQuantizedLinear(weight, nil, 32, 4, "mxfp4")
+	if ql.QBiases != nil {
+		t.Fatalf("mxfp4 qbiases = %v, want nil", ql.QBiases)
+	}
+
+	dequantizedWeight := mlx.Dequantize(ql.Weight, ql.Scales, ql.QBiases, 32, 4, "mxfp4", nil)
+	mlx.Eval(dequantizedWeight)
+
+	qOut := ql.Forward(input).AsType(mlx.DTypeFloat32)
+	dOut := NewLinear(dequantizedWeight, nil).Forward(input).AsType(mlx.DTypeFloat32)
+	mlx.Eval(qOut, dOut)
+
+	got := qOut.Floats()
+	want := dOut.Floats()
+	if len(got) != len(want) {
+		t.Fatalf("output length = %d, want %d", len(got), len(want))
+	}
+
+	for i := range got {
+		if !approxEqual(got[i], want[i], 1e-3) {
+			t.Fatalf("output[%d] = %.6f, want %.6f", i, got[i], want[i])
+		}
+	}
+}
+
+func TestQuantizedEmbeddingAsLinearPreservesGlobalScale(t *testing.T) {
+	weight := &mlx.Array{}
+	scales := &mlx.Array{}
+	qbiases := &mlx.Array{}
+	globalScale := &mlx.Array{}
+
+	embedding := &QuantizedEmbedding{
+		Weight:      weight,
+		Scales:      scales,
+		QBiases:     qbiases,
+		GlobalScale: globalScale,
+		GroupSize:   16,
+		Bits:        4,
+		Mode:        "nvfp4",
+	}
+
+	linear, ok := embedding.AsLinear().(*QuantizedLinear)
+	if !ok {
+		t.Fatalf("AsLinear type = %T, want *QuantizedLinear", embedding.AsLinear())
+	}
+	if linear.Weight != weight {
+		t.Fatalf("AsLinear Weight = %p, want %p", linear.Weight, weight)
+	}
+	if linear.Scales != scales {
+		t.Fatalf("AsLinear Scales = %p, want %p", linear.Scales, scales)
+	}
+	if linear.QBiases != qbiases {
+		t.Fatalf("AsLinear QBiases = %p, want %p", linear.QBiases, qbiases)
+	}
+	if linear.GlobalScale != globalScale {
+		t.Fatalf("AsLinear GlobalScale = %p, want %p", linear.GlobalScale, globalScale)
+	}
+	if linear.GroupSize != 16 || linear.Bits != 4 || linear.Mode != "nvfp4" {
+		t.Fatalf("AsLinear quant params = (%d, %d, %q), want (16, 4, %q)", linear.GroupSize, linear.Bits, linear.Mode, "nvfp4")
 	}
 }

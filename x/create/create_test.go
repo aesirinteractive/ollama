@@ -5,53 +5,50 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+
+	st "github.com/ollama/ollama/x/safetensors"
 )
 
-func TestIsTensorModelDir(t *testing.T) {
-	tests := []struct {
-		name     string
-		setup    func(dir string) error
-		expected bool
-	}{
-		{
-			name: "valid diffusers model with model_index.json",
-			setup: func(dir string) error {
-				return os.WriteFile(filepath.Join(dir, "model_index.json"), []byte(`{"_class_name": "FluxPipeline"}`), 0o644)
-			},
-			expected: true,
-		},
-		{
-			name: "empty directory",
-			setup: func(dir string) error {
-				return nil
-			},
-			expected: false,
-		},
-		{
-			name: "directory with other files but no model_index.json",
-			setup: func(dir string) error {
-				return os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{}`), 0o644)
-			},
-			expected: false,
-		},
+func TestValidateScalarFloat32TensorData(t *testing.T) {
+	td := st.NewTensorDataFromBytes("linear.weight_scale_2", "F32", []int32{}, encodeFloat32s(2))
+
+	got, err := validateScalarFloat32TensorData(td, "linear.weight.global_scale")
+	if err != nil {
+		t.Fatalf("validateScalarFloat32TensorData returned error: %v", err)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			dir := t.TempDir()
-			if err := tt.setup(dir); err != nil {
-				t.Fatalf("setup failed: %v", err)
-			}
+	if got.Name != "linear.weight.global_scale" {
+		t.Fatalf("name = %q, want %q", got.Name, "linear.weight.global_scale")
+	}
+	if got.Dtype != "F32" {
+		t.Fatalf("dtype = %q, want F32", got.Dtype)
+	}
+	if len(got.Shape) != 0 {
+		t.Fatalf("shape = %v, want scalar", got.Shape)
+	}
+}
 
-			got := IsTensorModelDir(dir)
-			if got != tt.expected {
-				t.Errorf("IsTensorModelDir() = %v, want %v", got, tt.expected)
-			}
-		})
+func TestValidateScalarFloat32TensorDataRejectsNonScalar(t *testing.T) {
+	td := st.NewTensorDataFromBytes("linear.weight_scale_2", "F32", []int32{2}, encodeFloat32s(2, 4))
+
+	_, err := validateScalarFloat32TensorData(td, "linear.weight.global_scale")
+	if err == nil || !strings.Contains(err.Error(), "expected scalar F32 tensor") {
+		t.Fatalf("validateScalarFloat32TensorData error = %v, want scalar-shape failure", err)
+	}
+}
+
+func TestInvertScalarFloat32TensorDataRejectsNonF32(t *testing.T) {
+	td := st.NewTensorDataFromBytes("linear.weight_global_scale", "BF16", []int32{}, []byte{0, 0})
+
+	_, err := invertScalarFloat32TensorData(td, "linear.weight.global_scale")
+	if err == nil || !strings.Contains(err.Error(), "expected F32 tensor") {
+		t.Fatalf("invertScalarFloat32TensorData error = %v, want dtype failure", err)
 	}
 }
 
@@ -129,249 +126,75 @@ func TestIsSafetensorsModelDir_NonexistentDir(t *testing.T) {
 	}
 }
 
-// createMinimalSafetensors creates a minimal valid safetensors file with one tensor
-func createMinimalSafetensors(t *testing.T, path string) {
+func createTestSafetensors(t *testing.T, path string, tensors []*st.TensorData) {
 	t.Helper()
 
-	// Create a minimal safetensors file with a single float32 tensor
-	header := map[string]interface{}{
-		"test_tensor": map[string]interface{}{
-			"dtype":        "F32",
-			"shape":        []int{2, 2},
-			"data_offsets": []int{0, 16}, // 4 float32 values = 16 bytes
-		},
-	}
-	headerJSON, err := json.Marshal(header)
+	data, err := io.ReadAll(st.BuildPackedSafetensorsReader(tensors))
 	if err != nil {
-		t.Fatalf("failed to marshal header: %v", err)
+		t.Fatalf("failed to build packed safetensors: %v", err)
 	}
-
-	// Pad header to 8-byte alignment
-	padding := (8 - len(headerJSON)%8) % 8
-	headerJSON = append(headerJSON, bytes.Repeat([]byte(" "), padding)...)
-
-	// Write file
-	f, err := os.Create(path)
-	if err != nil {
-		t.Fatalf("failed to create file: %v", err)
-	}
-	defer f.Close()
-
-	// Write header size (8 bytes, little endian)
-	if err := binary.Write(f, binary.LittleEndian, uint64(len(headerJSON))); err != nil {
-		t.Fatalf("failed to write header size: %v", err)
-	}
-
-	// Write header
-	if _, err := f.Write(headerJSON); err != nil {
-		t.Fatalf("failed to write header: %v", err)
-	}
-
-	// Write tensor data (16 bytes of zeros for 4 float32 values)
-	if _, err := f.Write(make([]byte, 16)); err != nil {
-		t.Fatalf("failed to write tensor data: %v", err)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("failed to write safetensors: %v", err)
 	}
 }
 
-func TestCreateSafetensorsModel(t *testing.T) {
-	dir := t.TempDir()
-
-	// Create config.json
-	configJSON := `{"model_type": "test", "architectures": ["TestModel"]}`
-	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(configJSON), 0o644); err != nil {
-		t.Fatalf("failed to write config.json: %v", err)
+func encodeFloat32s(vals ...float32) []byte {
+	raw := make([]byte, 4*len(vals))
+	for i, v := range vals {
+		binary.LittleEndian.PutUint32(raw[i*4:(i+1)*4], math.Float32bits(v))
 	}
-
-	// Create a minimal safetensors file
-	createMinimalSafetensors(t, filepath.Join(dir, "model.safetensors"))
-
-	// Track what was created
-	var createdLayers []LayerInfo
-	var manifestWritten bool
-	var manifestModelName string
-	var manifestConfigLayer LayerInfo
-	var manifestLayers []LayerInfo
-	var statusMessages []string
-
-	// Mock callbacks
-	createLayer := func(r io.Reader, mediaType, name string) (LayerInfo, error) {
-		data, err := io.ReadAll(r)
-		if err != nil {
-			return LayerInfo{}, err
-		}
-		layer := LayerInfo{
-			Digest:    "sha256:test",
-			Size:      int64(len(data)),
-			MediaType: mediaType,
-			Name:      name,
-		}
-		createdLayers = append(createdLayers, layer)
-		return layer, nil
-	}
-
-	createTensorLayer := func(r io.Reader, name, dtype string, shape []int32, quantize string) ([]LayerInfo, error) {
-		data, err := io.ReadAll(r)
-		if err != nil {
-			return nil, err
-		}
-		layer := LayerInfo{
-			Digest:    "sha256:tensor_" + name,
-			Size:      int64(len(data)),
-			MediaType: "application/vnd.ollama.image.tensor",
-			Name:      name,
-		}
-		createdLayers = append(createdLayers, layer)
-		return []LayerInfo{layer}, nil
-	}
-
-	writeManifest := func(modelName string, config LayerInfo, layers []LayerInfo) error {
-		manifestWritten = true
-		manifestModelName = modelName
-		manifestConfigLayer = config
-		manifestLayers = layers
-		return nil
-	}
-
-	progressFn := func(status string) {
-		statusMessages = append(statusMessages, status)
-	}
-
-	// Run CreateSafetensorsModel
-	err := CreateSafetensorsModel("test-model", dir, "", createLayer, createTensorLayer, writeManifest, progressFn)
-	if err != nil {
-		t.Fatalf("CreateSafetensorsModel failed: %v", err)
-	}
-
-	// Verify manifest was written
-	if !manifestWritten {
-		t.Error("manifest was not written")
-	}
-
-	if manifestModelName != "test-model" {
-		t.Errorf("manifest model name = %q, want %q", manifestModelName, "test-model")
-	}
-
-	// Verify config layer was set
-	if manifestConfigLayer.Name != "config.json" {
-		t.Errorf("config layer name = %q, want %q", manifestConfigLayer.Name, "config.json")
-	}
-
-	// Verify we have at least one tensor and one config layer
-	hasTensor := false
-	hasConfig := false
-	for _, layer := range manifestLayers {
-		if layer.Name == "test_tensor" {
-			hasTensor = true
-		}
-		if layer.Name == "config.json" {
-			hasConfig = true
-		}
-	}
-
-	if !hasTensor {
-		t.Error("no tensor layer found in manifest")
-	}
-	if !hasConfig {
-		t.Error("no config layer found in manifest")
-	}
-
-	// Verify status messages were sent
-	if len(statusMessages) == 0 {
-		t.Error("no status messages received")
-	}
+	return raw
 }
 
-func TestCreateSafetensorsModel_NoConfigJson(t *testing.T) {
-	dir := t.TempDir()
+func readSafetensorsHeaderNames(t *testing.T, data []byte) []string {
+	t.Helper()
 
-	// Create only a safetensors file, no config.json
-	createMinimalSafetensors(t, filepath.Join(dir, "model.safetensors"))
-
-	// Mock callbacks (minimal)
-	createLayer := func(r io.Reader, mediaType, name string) (LayerInfo, error) {
-		io.ReadAll(r)
-		return LayerInfo{Name: name}, nil
-	}
-	createTensorLayer := func(r io.Reader, name, dtype string, shape []int32, quantize string) ([]LayerInfo, error) {
-		io.ReadAll(r)
-		return []LayerInfo{{Name: name}}, nil
-	}
-	writeManifest := func(modelName string, config LayerInfo, layers []LayerInfo) error {
-		return nil
-	}
-	progressFn := func(status string) {}
-
-	err := CreateSafetensorsModel("test-model", dir, "", createLayer, createTensorLayer, writeManifest, progressFn)
-	if err == nil {
-		t.Error("expected error for missing config.json, got nil")
-	}
-}
-
-func TestCreateSafetensorsModel_EmptyDir(t *testing.T) {
-	dir := t.TempDir()
-
-	// Mock callbacks
-	createLayer := func(r io.Reader, mediaType, name string) (LayerInfo, error) {
-		return LayerInfo{}, nil
-	}
-	createTensorLayer := func(r io.Reader, name, dtype string, shape []int32, quantize string) ([]LayerInfo, error) {
-		return []LayerInfo{{}}, nil
-	}
-	writeManifest := func(modelName string, config LayerInfo, layers []LayerInfo) error {
-		return nil
-	}
-	progressFn := func(status string) {}
-
-	err := CreateSafetensorsModel("test-model", dir, "", createLayer, createTensorLayer, writeManifest, progressFn)
-	if err == nil {
-		t.Error("expected error for empty directory, got nil")
-	}
-}
-
-func TestCreateSafetensorsModel_SkipsIndexJson(t *testing.T) {
-	dir := t.TempDir()
-
-	// Create config.json
-	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{}`), 0o644); err != nil {
-		t.Fatalf("failed to write config.json: %v", err)
+	var headerSize uint64
+	if err := binary.Read(bytes.NewReader(data[:8]), binary.LittleEndian, &headerSize); err != nil {
+		t.Fatalf("failed to read header size: %v", err)
 	}
 
-	// Create model.safetensors.index.json (should be skipped)
-	indexJSON := `{"metadata": {"total_size": 100}, "weight_map": {}}`
-	if err := os.WriteFile(filepath.Join(dir, "model.safetensors.index.json"), []byte(indexJSON), 0o644); err != nil {
-		t.Fatalf("failed to write index.json: %v", err)
+	var header map[string]json.RawMessage
+	if err := json.Unmarshal(data[8:8+headerSize], &header); err != nil {
+		t.Fatalf("failed to parse header: %v", err)
 	}
 
-	// Create a minimal safetensors file
-	createMinimalSafetensors(t, filepath.Join(dir, "model.safetensors"))
-
-	var configNames []string
-
-	createLayer := func(r io.Reader, mediaType, name string) (LayerInfo, error) {
-		io.ReadAll(r)
-		configNames = append(configNames, name)
-		return LayerInfo{Name: name, Digest: "sha256:test"}, nil
-	}
-	createTensorLayer := func(r io.Reader, name, dtype string, shape []int32, quantize string) ([]LayerInfo, error) {
-		io.ReadAll(r)
-		return []LayerInfo{{Name: name}}, nil
-	}
-	writeManifest := func(modelName string, config LayerInfo, layers []LayerInfo) error {
-		return nil
-	}
-	progressFn := func(status string) {}
-
-	err := CreateSafetensorsModel("test-model", dir, "", createLayer, createTensorLayer, writeManifest, progressFn)
-	if err != nil {
-		t.Fatalf("CreateSafetensorsModel failed: %v", err)
-	}
-
-	// Verify model.safetensors.index.json was not included
-	for _, name := range configNames {
-		if name == "model.safetensors.index.json" {
-			t.Error("model.safetensors.index.json should have been skipped")
+	names := make([]string, 0, len(header))
+	for name := range header {
+		if name == "__metadata__" {
+			continue
 		}
+		names = append(names, name)
 	}
+	slices.Sort(names)
+	return names
+}
+
+func readPackedTensorRaw(t *testing.T, data []byte, tensorName string) []byte {
+	t.Helper()
+
+	var headerSize uint64
+	if err := binary.Read(bytes.NewReader(data[:8]), binary.LittleEndian, &headerSize); err != nil {
+		t.Fatalf("failed to read header size: %v", err)
+	}
+
+	var header map[string]struct {
+		Dtype       string  `json:"dtype"`
+		Shape       []int32 `json:"shape"`
+		DataOffsets [2]int  `json:"data_offsets"`
+	}
+	if err := json.Unmarshal(data[8:8+headerSize], &header); err != nil {
+		t.Fatalf("failed to parse header: %v", err)
+	}
+
+	info, ok := header[tensorName]
+	if !ok {
+		t.Fatalf("tensor %q not found in header", tensorName)
+	}
+
+	start := 8 + int(headerSize) + info.DataOffsets[0]
+	end := 8 + int(headerSize) + info.DataOffsets[1]
+	return data[start:end]
 }
 
 func TestResolveManifestPath(t *testing.T) {
@@ -510,6 +333,11 @@ func TestShouldQuantize(t *testing.T) {
 		{"ln prefix", "ln_1.weight", "", false},
 		{"layernorm in name", "input_layernorm.weight", "", false},
 
+		// Audio encoder tensors should not be quantized
+		{"audio tower weight", "model.audio_tower.layers.0.weight", "", false},
+		{"audio tower norm", "model.audio_tower.norm.weight", "", false},
+		{"embed audio weight", "embed_audio.weight", "", false},
+
 		// Biases should not be quantized
 		{"bias tensor", "attention.bias", "", false},
 		{"proj bias", "o_proj.bias", "", false},
@@ -534,62 +362,6 @@ func TestShouldQuantize(t *testing.T) {
 	}
 }
 
-func TestShouldQuantizeTensor(t *testing.T) {
-	tests := []struct {
-		name     string
-		tensor   string
-		shape    []int32
-		quantize string
-		want     bool
-	}{
-		// 2D tensors with sufficient size should be quantized
-		{"large 2D weight fp8", "q_proj.weight", []int32{4096, 4096}, "fp8", true},
-		{"medium 2D weight fp8", "small_proj.weight", []int32{128, 128}, "fp8", true},
-		{"large 2D weight nvfp4", "q_proj.weight", []int32{4096, 4096}, "nvfp4", true},
-
-		// Small tensors should not be quantized (< 1024 elements)
-		{"tiny 2D weight", "tiny.weight", []int32{16, 16}, "fp8", false},
-		{"small 2D weight", "small.weight", []int32{31, 31}, "fp8", false},
-
-		// 1D tensors should not be quantized
-		{"1D tensor", "layer_norm.weight", []int32{4096}, "fp8", false},
-
-		// 3D+ tensors should not be quantized
-		{"3D tensor", "conv.weight", []int32{64, 64, 3}, "fp8", false},
-		{"4D tensor", "conv2d.weight", []int32{64, 64, 3, 3}, "fp8", false},
-		{"stacked expert switch_mlp gate_up 3D int8", "model.layers.1.mlp.switch_mlp.gate_up_proj.weight", []int32{64, 22016, 4096}, "int8", true},
-		{"stacked expert experts down_proj 3D int8", "model.layers.1.mlp.experts.down_proj.weight", []int32{64, 4096, 14336}, "int8", true},
-		{"stacked expert combined gate_up 3D int8", "model.language_model.layers.0.mlp.experts.gate_up_proj", []int32{256, 1024, 2048}, "int8", true},
-		{"stacked expert combined down_proj 3D int8", "model.language_model.layers.0.mlp.experts.down_proj", []int32{256, 2048, 512}, "int8", true},
-
-		// Embeddings should not be quantized regardless of shape
-		{"embedding 2D", "embed_tokens.weight", []int32{32000, 4096}, "fp8", false},
-
-		// Norms should not be quantized regardless of shape
-		{"norm 2D", "layer_norm.weight", []int32{4096, 1}, "fp8", false},
-
-		// Biases should not be quantized
-		{"bias 2D", "proj.bias", []int32{4096, 1}, "fp8", false},
-
-		// Group size divisibility tests
-		// FP8/FP4 require divisible by 32
-		{"not divisible by 32 fp8", "proj.weight", []int32{128, 48}, "fp8", false},
-		{"divisible by 32 fp8", "proj.weight", []int32{128, 64}, "fp8", true},
-		// NVFP4 requires divisible by 16
-		{"not divisible by 16 nvfp4", "proj.weight", []int32{128, 24}, "nvfp4", false},
-		{"divisible by 16 nvfp4", "proj.weight", []int32{128, 48}, "nvfp4", true},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := ShouldQuantizeTensor(tt.tensor, tt.shape, tt.quantize)
-			if got != tt.want {
-				t.Errorf("ShouldQuantizeTensor(%q, %v, %q) = %v, want %v", tt.tensor, tt.shape, tt.quantize, got, tt.want)
-			}
-		})
-	}
-}
-
 func TestExpertGroupPrefix(t *testing.T) {
 	tests := []struct {
 		name string
@@ -600,9 +372,48 @@ func TestExpertGroupPrefix(t *testing.T) {
 		{"model.layers.1.mlp.experts.63.gate_proj.weight", "model.layers.1.mlp.experts"},
 		{"model.layers.0.mlp.experts.0.up_proj.weight", "model.layers.0.mlp.experts"},
 
+		// MoE expert tensors (Gemma-style .moe.experts.)
+		{"model.layers.0.moe.experts.0.gate_proj.weight", "model.layers.0.moe.experts"},
+		{"model.layers.1.moe.experts.42.down_proj.weight", "model.layers.1.moe.experts"},
+		{"language_model.model.layers.2.moe.experts.127.up_proj.weight", "language_model.model.layers.2.moe.experts"},
+
+		// Expert tensors with language_model prefix should also match
+		{"language_model.model.layers.0.mlp.experts.0.gate_proj.weight", "language_model.model.layers.0.mlp.experts"},
+		{"language_model.model.layers.1.mlp.experts.255.down_proj.weight", "language_model.model.layers.1.mlp.experts"},
+
 		// Shared expert tensors should return their own group prefix
 		{"model.layers.1.mlp.shared_experts.down_proj.weight", "model.layers.1.mlp.shared_experts"},
 		{"model.layers.2.mlp.shared_experts.gate_proj.weight", "model.layers.2.mlp.shared_experts"},
+
+		// Rewritten Qwen switch_mlp tensors should also be packed per-layer.
+		{"model.layers.1.mlp.switch_mlp.down_proj.weight", "model.layers.1.mlp.switch_mlp"},
+		{"language_model.layers.2.mlp.switch_mlp.gate_proj.weight", "language_model.layers.2.mlp.switch_mlp"},
+		{"language_model.model.layers.3.mlp.switch_mlp.up_proj.weight", "language_model.model.layers.3.mlp.switch_mlp"},
+		{"model.language_model.layers.4.mlp.switch_mlp.gate_proj.weight", "model.language_model.layers.4.mlp.switch_mlp"},
+
+		// Nemotron-style expert tensors (backbone.layers.N.mixer.experts.M)
+		{"backbone.layers.1.mixer.experts.0.down_proj.weight", "backbone.layers.1.mixer.experts"},
+		{"backbone.layers.2.mixer.experts.127.up_proj.weight", "backbone.layers.2.mixer.experts"},
+		{"language_model.backbone.layers.3.mixer.experts.42.down_proj.weight", "language_model.backbone.layers.3.mixer.experts"},
+		{"model.language_model.backbone.layers.4.mixer.experts.7.up_proj.weight", "model.language_model.backbone.layers.4.mixer.experts"},
+
+		// Nemotron-style shared expert tensors
+		{"backbone.layers.1.mixer.shared_experts.down_proj.weight", "backbone.layers.1.mixer.shared_experts"},
+		{"backbone.layers.2.mixer.shared_experts.up_proj.weight", "backbone.layers.2.mixer.shared_experts"},
+
+		// Nemotron routing gate is not an expert
+		{"backbone.layers.1.mixer.gate.weight", ""},
+
+		// MTP expert tensors (mtp.layers.N.mixer.experts.M)
+		{"mtp.layers.1.mixer.experts.0.up_proj.weight", "mtp.layers.1.mixer.experts"},
+		{"mtp.layers.1.mixer.experts.127.down_proj.weight", "mtp.layers.1.mixer.experts"},
+
+		// MTP shared expert tensors
+		{"mtp.layers.1.mixer.shared_experts.up_proj.weight", "mtp.layers.1.mixer.shared_experts"},
+		{"mtp.layers.1.mixer.shared_experts.down_proj.weight", "mtp.layers.1.mixer.shared_experts"},
+
+		// MTP routing gate is not an expert
+		{"mtp.layers.1.mixer.gate.weight", ""},
 
 		// Non-expert tensors should return empty string
 		{"model.layers.0.mlp.down_proj.weight", ""},    // dense layer, no experts
@@ -659,179 +470,134 @@ func TestGetTensorQuantization_StackedExpert3D(t *testing.T) {
 	if combinedDown != "int8" {
 		t.Fatalf("combined down_proj quantization = %q, want %q", combinedDown, "int8")
 	}
-}
 
-func TestCreateSafetensorsModel_WithQuantize(t *testing.T) {
-	dir := t.TempDir()
-
-	// Create config.json
-	configJSON := `{"model_type": "test", "architectures": ["TestModel"]}`
-	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(configJSON), 0o644); err != nil {
-		t.Fatalf("failed to write config.json: %v", err)
+	nvfp4GateUp := GetTensorQuantization(
+		"language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight",
+		[]int32{64, 11008, 4096},
+		"nvfp4",
+	)
+	if nvfp4GateUp != "nvfp4" {
+		t.Fatalf("nvfp4 gate_proj quantization = %q, want %q", nvfp4GateUp, "nvfp4")
 	}
 
-	// Create a minimal safetensors file
-	createMinimalSafetensors(t, filepath.Join(dir, "model.safetensors"))
-
-	var quantizeRequested []string
-
-	createLayer := func(r io.Reader, mediaType, name string) (LayerInfo, error) {
-		io.ReadAll(r)
-		return LayerInfo{Name: name, Digest: "sha256:test"}, nil
+	nvfp4Down := GetTensorQuantization(
+		"language_model.model.layers.0.mlp.switch_mlp.down_proj.weight",
+		[]int32{64, 4096, 11008},
+		"nvfp4",
+	)
+	if nvfp4Down != "nvfp4" {
+		t.Fatalf("nvfp4 down_proj quantization = %q, want %q", nvfp4Down, "nvfp4")
 	}
 
-	createTensorLayer := func(r io.Reader, name, dtype string, shape []int32, quantize string) ([]LayerInfo, error) {
-		io.ReadAll(r)
-		quantizeRequested = append(quantizeRequested, quantize)
-		return []LayerInfo{{Name: name}}, nil
+	mxfp4GateUp := GetTensorQuantization(
+		"language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight",
+		[]int32{64, 11008, 4096},
+		"mxfp4",
+	)
+	if mxfp4GateUp != "mxfp4" {
+		t.Fatalf("mxfp4 gate_proj quantization = %q, want %q", mxfp4GateUp, "mxfp4")
 	}
 
-	writeManifest := func(modelName string, config LayerInfo, layers []LayerInfo) error {
-		return nil
-	}
-
-	progressFn := func(status string) {}
-
-	// Run with quantize enabled
-	err := CreateSafetensorsModel("test-model", dir, "fp8", createLayer, createTensorLayer, writeManifest, progressFn)
-	if err != nil {
-		t.Fatalf("CreateSafetensorsModel failed: %v", err)
-	}
-
-	// Verify quantize was passed to callback (will be false for small test tensor)
-	if len(quantizeRequested) == 0 {
-		t.Error("no tensors processed")
+	mxfp4Down := GetTensorQuantization(
+		"language_model.model.layers.0.mlp.switch_mlp.down_proj.weight",
+		[]int32{64, 4096, 11008},
+		"mxfp4",
+	)
+	if mxfp4Down != "mxfp4" {
+		t.Fatalf("mxfp4 down_proj quantization = %q, want %q", mxfp4Down, "mxfp4")
 	}
 }
 
-// createMinimalImageGenModel creates a minimal diffusers-style model directory
-func createMinimalImageGenModel(t *testing.T, dir string) {
-	t.Helper()
+func TestIsAligned(t *testing.T) {
+	tests := []struct {
+		name      string
+		shape     []int32
+		quantType string
+		want      bool
+	}{
+		// int4/int8: group_size=64
+		{"int4 aligned", []int32{1024, 4096}, "int4", true},
+		{"int4 unaligned", []int32{1024, 48}, "int4", false},
+		{"int8 aligned", []int32{1024, 128}, "int8", true},
+		{"int8 unaligned", []int32{1024, 32}, "int8", false},
 
-	// Create model_index.json
-	modelIndex := `{"_class_name": "FluxPipeline", "_diffusers_version": "0.30.0"}`
-	if err := os.WriteFile(filepath.Join(dir, "model_index.json"), []byte(modelIndex), 0o644); err != nil {
-		t.Fatalf("failed to write model_index.json: %v", err)
+		// nvfp4: group_size=16
+		{"nvfp4 aligned", []int32{1024, 48}, "nvfp4", true},
+		{"nvfp4 unaligned", []int32{1024, 24}, "nvfp4", false},
+		{"nvfp4 aligned 16", []int32{1024, 16}, "nvfp4", true},
+
+		// mxfp4/mxfp8: group_size=32
+		{"mxfp4 aligned", []int32{1024, 64}, "mxfp4", true},
+		{"mxfp4 unaligned", []int32{1024, 48}, "mxfp4", false},
+		{"mxfp8 aligned", []int32{1024, 32}, "mxfp8", true},
+		{"mxfp8 unaligned", []int32{1024, 24}, "mxfp8", false},
+
+		// Edge cases
+		{"empty shape", []int32{}, "int4", false},
+		{"1D tensor", []int32{4096}, "int4", true},
+		{"3D stacked expert", []int32{128, 4096, 2816}, "int4", true},
 	}
 
-	// Create transformer directory with a safetensors file
-	transformerDir := filepath.Join(dir, "transformer")
-	if err := os.MkdirAll(transformerDir, 0o755); err != nil {
-		t.Fatalf("failed to create transformer dir: %v", err)
-	}
-	createMinimalSafetensors(t, filepath.Join(transformerDir, "model.safetensors"))
-
-	// Create transformer config
-	transformerConfig := `{"hidden_size": 3072}`
-	if err := os.WriteFile(filepath.Join(transformerDir, "config.json"), []byte(transformerConfig), 0o644); err != nil {
-		t.Fatalf("failed to write transformer config: %v", err)
-	}
-}
-
-func TestCreateImageGenModel(t *testing.T) {
-	dir := t.TempDir()
-	createMinimalImageGenModel(t, dir)
-
-	var manifestWritten bool
-	var manifestModelName string
-	var statusMessages []string
-
-	createLayer := func(r io.Reader, mediaType, name string) (LayerInfo, error) {
-		io.ReadAll(r)
-		return LayerInfo{Name: name, Digest: "sha256:test"}, nil
-	}
-
-	createTensorLayer := func(r io.Reader, name, dtype string, shape []int32, quantize string) ([]LayerInfo, error) {
-		io.ReadAll(r)
-		return []LayerInfo{{Name: name, Digest: "sha256:tensor"}}, nil
-	}
-
-	writeManifest := func(modelName string, config LayerInfo, layers []LayerInfo) error {
-		manifestWritten = true
-		manifestModelName = modelName
-		return nil
-	}
-
-	progressFn := func(status string) {
-		statusMessages = append(statusMessages, status)
-	}
-
-	err := CreateImageGenModel("test-imagegen", dir, "", createLayer, createTensorLayer, writeManifest, progressFn)
-	if err != nil {
-		t.Fatalf("CreateImageGenModel failed: %v", err)
-	}
-
-	if !manifestWritten {
-		t.Error("manifest was not written")
-	}
-
-	if manifestModelName != "test-imagegen" {
-		t.Errorf("manifest model name = %q, want %q", manifestModelName, "test-imagegen")
-	}
-
-	if len(statusMessages) == 0 {
-		t.Error("no status messages received")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isAligned(tt.shape, tt.quantType)
+			if got != tt.want {
+				t.Errorf("isAligned(%v, %q) = %v, want %v", tt.shape, tt.quantType, got, tt.want)
+			}
+		})
 	}
 }
 
-func TestCreateImageGenModel_NoModelIndex(t *testing.T) {
-	dir := t.TempDir()
+func TestGetTensorQuantization_MixedPrecisionPromotion(t *testing.T) {
+	aligned := []int32{4096, 4096} // divisible by 64
 
-	// Create only transformer without model_index.json
-	transformerDir := filepath.Join(dir, "transformer")
-	if err := os.MkdirAll(transformerDir, 0o755); err != nil {
-		t.Fatalf("failed to create transformer dir: %v", err)
-	}
-	createMinimalSafetensors(t, filepath.Join(transformerDir, "model.safetensors"))
+	tests := []struct {
+		name     string
+		tensor   string
+		shape    []int32
+		quantize string
+		want     string
+	}{
+		// int4 → int8 promotion for sensitive tensors
+		{"v_proj int4 promoted", "model.layers.0.self_attn.v_proj.weight", aligned, "int4", "int8"},
+		{"k_proj int4 promoted", "model.layers.0.self_attn.k_proj.weight", aligned, "int4", "int8"},
+		{"down_proj int4 promoted", "model.layers.0.mlp.down_proj.weight", aligned, "int4", "int8"},
 
-	createLayer := func(r io.Reader, mediaType, name string) (LayerInfo, error) {
-		io.ReadAll(r)
-		return LayerInfo{Name: name}, nil
-	}
-	createTensorLayer := func(r io.Reader, name, dtype string, shape []int32, quantize string) ([]LayerInfo, error) {
-		io.ReadAll(r)
-		return []LayerInfo{{Name: name}}, nil
-	}
-	writeManifest := func(modelName string, config LayerInfo, layers []LayerInfo) error {
-		return nil
-	}
-	progressFn := func(status string) {}
+		// Non-sensitive int4 tensors stay int4
+		{"q_proj int4 stays", "model.layers.0.self_attn.q_proj.weight", aligned, "int4", "int4"},
+		{"o_proj int4 stays", "model.layers.0.self_attn.o_proj.weight", aligned, "int4", "int4"},
+		{"gate_proj int4 stays", "model.layers.0.mlp.gate_proj.weight", aligned, "int4", "int4"},
+		{"up_proj int4 stays", "model.layers.0.mlp.up_proj.weight", aligned, "int4", "int4"},
 
-	err := CreateImageGenModel("test-imagegen", dir, "", createLayer, createTensorLayer, writeManifest, progressFn)
-	if err == nil {
-		t.Error("expected error for missing model_index.json, got nil")
-	}
-}
+		// nvfp4/mxfp4 → mxfp8 promotion for sensitive tensors; mxfp8 stays uniform
+		{"v_proj nvfp4 promoted", "model.layers.0.self_attn.v_proj.weight", aligned, "nvfp4", "mxfp8"},
+		{"down_proj mxfp4 promoted", "model.layers.0.mlp.down_proj.weight", aligned, "mxfp4", "mxfp8"},
+		{"q_proj nvfp4 stays", "model.layers.0.self_attn.q_proj.weight", aligned, "nvfp4", "nvfp4"},
+		{"v_proj mxfp8 uniform", "model.layers.0.self_attn.v_proj.weight", aligned, "mxfp8", "mxfp8"},
 
-func TestCreateImageGenModel_WithQuantize(t *testing.T) {
-	dir := t.TempDir()
-	createMinimalImageGenModel(t, dir)
+		// int8: already 8-bit, no promotion
+		{"v_proj int8 stays", "model.layers.0.self_attn.v_proj.weight", aligned, "int8", "int8"},
 
-	var quantizeRequested []string
+		// lm_head resolves to the 8-bit type in the requested family
+		{"lm_head nvfp4 to mxfp8", "lm_head.weight", aligned, "nvfp4", "mxfp8"},
+		{"lm_head mxfp8 uniform", "lm_head.weight", aligned, "mxfp8", "mxfp8"},
+		{"lm_head int4 promoted", "lm_head.weight", aligned, "int4", "int8"},
 
-	createLayer := func(r io.Reader, mediaType, name string) (LayerInfo, error) {
-		io.ReadAll(r)
-		return LayerInfo{Name: name, Digest: "sha256:test"}, nil
-	}
+		// Expert tensors: down_proj also promoted for int4
+		{"expert down_proj int4", "model.layers.0.mlp.experts.down_proj.weight", []int32{128, 4096, 2816}, "int4", "int8"},
+		{"moe expert down_proj int4", "model.layers.0.moe.experts.down_proj.weight", []int32{128, 4096, 2816}, "int4", "int8"},
 
-	createTensorLayer := func(r io.Reader, name, dtype string, shape []int32, quantize string) ([]LayerInfo, error) {
-		io.ReadAll(r)
-		quantizeRequested = append(quantizeRequested, quantize)
-		return []LayerInfo{{Name: name}}, nil
+		// Unaligned: falls back to bf16 (empty string)
+		{"v_proj int4 unaligned", "model.layers.0.self_attn.v_proj.weight", []int32{1024, 48}, "int4", ""},
 	}
 
-	writeManifest := func(modelName string, config LayerInfo, layers []LayerInfo) error {
-		return nil
-	}
-
-	progressFn := func(status string) {}
-
-	err := CreateImageGenModel("test-imagegen", dir, "int8", createLayer, createTensorLayer, writeManifest, progressFn)
-	if err != nil {
-		t.Fatalf("CreateImageGenModel failed: %v", err)
-	}
-
-	if len(quantizeRequested) == 0 {
-		t.Error("no tensors processed")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := GetTensorQuantization(tt.tensor, tt.shape, tt.quantize)
+			if got != tt.want {
+				t.Errorf("GetTensorQuantization(%q, %v, %q) = %q, want %q",
+					tt.tensor, tt.shape, tt.quantize, got, tt.want)
+			}
+		})
 	}
 }

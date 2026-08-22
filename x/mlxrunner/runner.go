@@ -6,11 +6,14 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"slices"
 	"strings"
 
 	"golang.org/x/sync/errgroup"
 
 	"github.com/ollama/ollama/api"
+	"github.com/ollama/ollama/x/internal/mlxthread"
+	"github.com/ollama/ollama/x/mlxrunner/cache"
 	"github.com/ollama/ollama/x/mlxrunner/mlx"
 	"github.com/ollama/ollama/x/mlxrunner/model"
 	"github.com/ollama/ollama/x/mlxrunner/model/base"
@@ -18,38 +21,33 @@ import (
 	"github.com/ollama/ollama/x/tokenizer"
 )
 
+// Request is a short-lived struct that carries a completion request through
+// a channel from the HTTP handler to the runner goroutine. The ctx field
+// must travel with the request so that cancellation propagates across the
+// channel boundary.
 type Request struct {
-	TextCompletionsRequest
+	CompletionRequest
 	Responses chan CompletionResponse
-	Pipeline  func(Request) error
+	Pipeline  func(context.Context, Request) error
 
-	Ctx context.Context
-
-	Sampler *sample.Sampler
-}
-
-type TextCompletionsRequest struct {
-	Prompt  string `json:"prompt"`
-	Options struct {
-		Temperature     float32 `json:"temperature"`
-		TopP            float32 `json:"top_p"`
-		MinP            float32 `json:"min_p"`
-		TopK            int     `json:"top_k"`
-		RepeatLastN     int     `json:"repeat_last_n"`
-		PresencePenalty float32 `json:"presence_penalty"`
-		MaxTokens       int     `json:"max_tokens"`
-
-		// Deprecated: use MaxTokens instead
-		NumPredict int `json:"num_predict"`
-	} `json:"options"`
+	Ctx         context.Context //nolint:containedctx // Queued requests carry caller cancellation to the runner.
+	Tokens      []int32
+	MediaItems  []mediaItem
+	Layout      any // opaque PrepareMedia layout state, stamped on every batch
+	SamplerOpts sample.Options
 }
 
 type Runner struct {
 	Model         base.Model
 	Tokenizer     *tokenizer.Tokenizer
 	Requests      chan Request
-	cache         kvCache
+	Sampler       *sample.Sampler
+	cache         *prefixCache
 	contextLength int
+	mlxThread     *mlxthread.Thread
+	// spec is the speculative-decoding subsystem. Nil when the model ships no
+	// draft head.
+	spec *speculation
 }
 
 func (r *Runner) Load(modelName string) error {
@@ -70,16 +68,100 @@ func (r *Runner) Load(modelName string) error {
 		return err
 	}
 
-	// Assign weights to model (model-specific logic)
-	loadWeights := base.Weights(m)
-	if err := loadWeights(tensors); err != nil {
+	// Assign weights to model (model-specific logic). Target and draft weights
+	// must be loaded before sweeping so tensors from a combined manifest are
+	// not discarded before the draft model can retain them.
+	if err := m.LoadWeights(tensors); err != nil {
 		return err
 	}
+
+	var draftModel base.DraftModel
+	draft, err := base.NewDraft(root, m)
+	if err != nil {
+		return err
+	}
+	if draft != nil {
+		if err := draft.LoadWeights(tensors); err != nil {
+			return err
+		}
+		draftModel = draft
+	} else if sd, ok := m.(base.SelfDraft); ok {
+		// Inline draft head: already loaded with the target; nil if none shipped.
+		draftModel = sd.SelfDraft()
+	}
+
+	collected := mlx.Collect(m)
+	if draft != nil {
+		draftArrays := mlx.Collect(draft)
+		collected = append(collected, draftArrays...)
+		if root.Draft != nil {
+			slog.Info("Loaded draft model", "tensor_prefix", root.Draft.TensorPrefix, "config", root.Draft.Config, "arrays", len(draftArrays))
+		} else {
+			slog.Info("Loaded draft model", "arrays", len(draftArrays))
+		}
+	}
+	for _, arr := range collected {
+		mlx.Pin(arr)
+	}
+	mlx.Sweep()
+	mlx.Eval(collected...)
+	configureWiredMemory()
 
 	r.Model = m
 	r.Tokenizer = m.Tokenizer()
 	r.contextLength = m.MaxContextLength()
+	caches := m.NewCaches()
+	draftCaches := newDraftCaches(draftModel)
+	r.cache = newPrefixCache(slices.Concat(caches, draftCaches))
+	r.Sampler = sample.New(r.contextLength)
+	r.spec = newSpeculation(r, draftModel, caches, draftCaches)
+
+	mlx.EnableCompile()
+
 	return nil
+}
+
+// newDraftCaches returns nil when the model ships no draft.
+func newDraftCaches(draft base.DraftModel) []cache.Cache {
+	if draft == nil {
+		return nil
+	}
+	return draft.NewCaches()
+}
+
+func configureWiredMemory() {
+	if !mlx.GPUIsAvailable() {
+		return
+	}
+
+	active := mlx.ActiveMemory()
+	maxRecommended, err := mlx.MaxRecommendedWorkingSetSize()
+	if err != nil {
+		slog.Warn("Unable to query MLX recommended working set; using pageable memory", "error", err)
+		return
+	}
+
+	limit := min(active, maxRecommended)
+	previous, err := mlx.SetWiredLimit(limit)
+	if err != nil {
+		slog.Warn("Unable to configure MLX wired memory; using pageable memory",
+			"active", mlx.PrettyBytes(active),
+			"limit", mlx.PrettyBytes(limit),
+			"error", err)
+		return
+	}
+
+	if active > maxRecommended {
+		slog.Warn("MLX model exceeds the recommended working set; performance may be degraded",
+			"active", mlx.PrettyBytes(active),
+			"recommended", mlx.PrettyBytes(maxRecommended))
+	}
+	// Limiting residency to the loaded model's active allocations avoids
+	// reserving the remaining capacity for growing KV caches.
+	slog.Debug("Configured MLX wired memory",
+		"active", mlx.PrettyBytes(active),
+		"limit", mlx.PrettyBytes(limit),
+		"previous", mlx.PrettyBytes(previous))
 }
 
 // loadTensorsFromManifest loads all tensor blobs from the manifest into a
@@ -145,7 +227,8 @@ func (r *Runner) Run(host, port string, mux http.Handler) error {
 			case <-ctx.Done():
 				return nil
 			case request := <-r.Requests:
-				if err := request.Pipeline(request); err != nil {
+				err := r.runRequest(request)
+				if err != nil {
 					slog.Info("Request terminated", "error", err)
 					var statusErr api.StatusError
 					if !errors.As(err, &statusErr) {
@@ -171,4 +254,14 @@ func (r *Runner) Run(host, port string, mux http.Handler) error {
 	})
 
 	return g.Wait()
+}
+
+func (r *Runner) runRequest(request Request) error {
+	if r.mlxThread == nil {
+		return request.Pipeline(request.Ctx, request)
+	}
+
+	return r.mlxThread.Do(request.Ctx, func() error {
+		return request.Pipeline(request.Ctx, request)
+	})
 }

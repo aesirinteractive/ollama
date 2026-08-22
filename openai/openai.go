@@ -3,6 +3,7 @@ package openai
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -10,15 +11,12 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"slices"
 	"strings"
 	"time"
 
 	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/types/model"
 )
-
-var finishReasonToolCalls = "tool_calls"
 
 type Error struct {
 	Message string  `json:"message"`
@@ -40,6 +38,15 @@ type Message struct {
 	ToolCallID string     `json:"tool_call_id,omitempty"`
 }
 
+// Delta is used in streaming chunk responses. All fields use omitempty so
+// that a finish chunk produces a truly empty delta `{}` matching the OpenAI spec.
+type Delta struct {
+	Role      string     `json:"role,omitempty"`
+	Content   any        `json:"content,omitempty"`
+	Reasoning string     `json:"reasoning,omitempty"`
+	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
+}
+
 type ChoiceLogprobs struct {
 	Content []api.Logprob `json:"content"`
 }
@@ -53,7 +60,7 @@ type Choice struct {
 
 type ChunkChoice struct {
 	Index        int             `json:"index"`
-	Delta        Message         `json:"delta"`
+	Delta        Delta           `json:"delta"`
 	FinishReason *string         `json:"finish_reason"`
 	Logprobs     *ChoiceLogprobs `json:"logprobs,omitempty"`
 }
@@ -277,7 +284,7 @@ func ToChatCompletion(id string, r api.ChatResponse) ChatCompletion {
 			Index:   0,
 			Message: Message{Role: r.Message.Role, Content: r.Message.Content, ToolCalls: toolCalls, Reasoning: r.Message.Thinking},
 			FinishReason: func(reason string) *string {
-				if len(toolCalls) > 0 {
+				if reason == "stop" && len(toolCalls) > 0 {
 					reason = "tool_calls"
 				}
 				if len(reason) > 0 {
@@ -291,7 +298,7 @@ func ToChatCompletion(id string, r api.ChatResponse) ChatCompletion {
 	}
 }
 
-func toChunk(id string, r api.ChatResponse, toolCallSent bool) ChatCompletionChunk {
+func toChunk(id string, r api.ChatResponse, includeRole bool) ChatCompletionChunk {
 	toolCalls := ToToolCalls(r.Message.ToolCalls)
 
 	var logprobs *ChoiceLogprobs
@@ -299,43 +306,53 @@ func toChunk(id string, r api.ChatResponse, toolCallSent bool) ChatCompletionChu
 		logprobs = &ChoiceLogprobs{Content: r.Logprobs}
 	}
 
+	var role string
+	if includeRole {
+		role = "assistant"
+	}
+
+	// Content is typed as any with omitempty: nil is omitted, "" is kept.
+	// Use the string value from the response so empty-string content (e.g. first
+	// chunk or reasoning-only) is explicitly serialized as "content":"".
+	var content any = r.Message.Content
+
+	// Stamp the chunk with the response's timestamp; OpenAI reuses one created
+	// value across a stream. Fall back to now when the response carries none
+	// (e.g. synthetic responses).
+	created := r.CreatedAt.Unix()
+	if r.CreatedAt.IsZero() {
+		created = time.Now().Unix()
+	}
+
 	return ChatCompletionChunk{
 		Id:                id,
 		Object:            "chat.completion.chunk",
-		Created:           time.Now().Unix(),
+		Created:           created,
 		Model:             r.Model,
 		SystemFingerprint: "fp_ollama",
 		Choices: []ChunkChoice{{
-			Index: 0,
-			Delta: Message{Role: "assistant", Content: r.Message.Content, ToolCalls: toolCalls, Reasoning: r.Message.Thinking},
-			FinishReason: func(reason string) *string {
-				if len(reason) > 0 {
-					if toolCallSent || len(toolCalls) > 0 {
-						return &finishReasonToolCalls
-					}
-					return &reason
-				}
-				return nil
-			}(r.DoneReason),
+			Index:    0,
+			Delta:    Delta{Role: role, Content: content, ToolCalls: toolCalls, Reasoning: r.Message.Thinking},
 			Logprobs: logprobs,
 		}},
 	}
 }
 
-// ToChunks converts an api.ChatResponse to one or more ChatCompletionChunk values.
-func ToChunks(id string, r api.ChatResponse, toolCallSent bool) []ChatCompletionChunk {
+// ToStreamChunks converts an api.ChatResponse to one or more ChatCompletionChunk values.
+// includeRole controls whether the "role" field appears in the delta (should be true
+// only for the first chunk in a stream, matching the OpenAI spec).
+func ToStreamChunks(id string, r api.ChatResponse, includeRole bool) []ChatCompletionChunk {
 	hasMixedResponse := r.Message.Thinking != "" && (r.Message.Content != "" || len(r.Message.ToolCalls) > 0)
 	if !hasMixedResponse {
-		return []ChatCompletionChunk{toChunk(id, r, toolCallSent)}
+		return []ChatCompletionChunk{toChunk(id, r, includeRole)}
 	}
 
-	reasoningChunk := toChunk(id, r, toolCallSent)
+	reasoningChunk := toChunk(id, r, includeRole)
 	// The logprobs here might include tokens not in this chunk because we now split between thinking and content/tool calls.
-	reasoningChunk.Choices[0].Delta.Content = ""
+	reasoningChunk.Choices[0].Delta.Content = nil
 	reasoningChunk.Choices[0].Delta.ToolCalls = nil
-	reasoningChunk.Choices[0].FinishReason = nil
 
-	contentOrToolCallsChunk := toChunk(id, r, toolCallSent)
+	contentOrToolCallsChunk := toChunk(id, r, false)
 	// Keep both split chunks on the same timestamp since they represent one logical emission.
 	contentOrToolCallsChunk.Created = reasoningChunk.Created
 	contentOrToolCallsChunk.Choices[0].Delta.Reasoning = ""
@@ -347,9 +364,34 @@ func ToChunks(id string, r api.ChatResponse, toolCallSent bool) []ChatCompletion
 	}
 }
 
-// Deprecated: use ToChunks for streaming conversion.
-func ToChunk(id string, r api.ChatResponse, toolCallSent bool) ChatCompletionChunk {
-	return toChunk(id, r, toolCallSent)
+// FinishChunk creates a dedicated finish-reason chunk with an empty delta,
+// matching the OpenAI spec where finish_reason is sent on its own chunk.
+func FinishChunk(id string, r api.ChatResponse, toolCallSent bool) ChatCompletionChunk {
+	// Only remap known terminal reasons; pass anything else through untouched.
+	// tool_calls only overrides stop — an unfinished or unknown done reason
+	// must not be relabeled tool_calls.
+	reason := cmp.Or(r.DoneReason, "stop")
+	if reason == "stop" && toolCallSent {
+		reason = "tool_calls"
+	}
+	// Stamp the chunk with the completion's timestamp like OpenAI does; fall
+	// back to now when the response carries none (e.g. synthetic responses).
+	created := r.CreatedAt.Unix()
+	if r.CreatedAt.IsZero() {
+		created = time.Now().Unix()
+	}
+	return ChatCompletionChunk{
+		Id:                id,
+		Object:            "chat.completion.chunk",
+		Created:           created,
+		Model:             r.Model,
+		SystemFingerprint: "fp_ollama",
+		Choices: []ChunkChoice{{
+			Index:        0,
+			Delta:        Delta{},
+			FinishReason: &reason,
+		}},
+	}
 }
 
 // ToUsageGenerate converts an api.GenerateResponse to Usage
@@ -408,11 +450,16 @@ func ToCompleteChunk(id string, r api.GenerateResponse) CompletionChunk {
 func ToListCompletion(r api.ListResponse) ListCompletion {
 	var data []Model
 	for _, m := range r.Models {
+		id := m.Model
+		if id == "" {
+			id = m.Name
+		}
+
 		data = append(data, Model{
-			Id:      m.Name,
+			Id:      id,
 			Object:  "model",
 			Created: m.ModifiedAt.Unix(),
-			OwnedBy: model.ParseName(m.Name).Namespace,
+			OwnedBy: model.ParseName(id).Namespace,
 		})
 	}
 
@@ -473,6 +520,31 @@ func ToModel(r api.ShowResponse, m string) Model {
 	}
 }
 
+// thinkFromReasoningEffort converts an OpenAI reasoning effort to the equivalent
+// Ollama think value. An empty effort leaves thinking at the model's default.
+//
+// OpenAI's scale extends past both ends of Ollama's ("minimal" below "low",
+// "xhigh" above "high"), and clients built on it add tiers of their own
+// ("ultra"). Clamp those to the nearest Ollama tier rather than rejecting the
+// request, since the alternative is a 400 for an effort the client considers
+// perfectly valid.
+func thinkFromReasoningEffort(effort string) (*api.ThinkValue, error) {
+	switch effort {
+	case "":
+		return nil, nil
+	case "none":
+		return &api.ThinkValue{Value: false}, nil
+	case "minimal":
+		return &api.ThinkValue{Value: "low"}, nil
+	case "low", "medium", "high", "max":
+		return &api.ThinkValue{Value: effort}, nil
+	case "xhigh", "ultra":
+		return &api.ThinkValue{Value: "max"}, nil
+	default:
+		return nil, fmt.Errorf("invalid reasoning value: %q (must be \"minimal\", \"low\", \"medium\", \"high\", \"xhigh\", \"ultra\", \"max\", or \"none\")", effort)
+	}
+}
+
 // FromChatRequest converts a ChatCompletionRequest to api.ChatRequest
 func FromChatRequest(r ChatCompletionRequest) (*api.ChatRequest, error) {
 	var messages []api.Message
@@ -522,6 +594,20 @@ func FromChatRequest(r ChatCompletionRequest) (*api.ChatRequest, error) {
 					}
 
 					messages = append(messages, api.Message{Role: msg.Role, Images: []api.ImageData{img}})
+				case "input_audio":
+					audioMap, ok := data["input_audio"].(map[string]any)
+					if !ok {
+						return nil, errors.New("invalid input_audio format")
+					}
+					b64Data, ok := audioMap["data"].(string)
+					if !ok {
+						return nil, errors.New("invalid input_audio format: missing data")
+					}
+					audioBytes, err := base64.StdEncoding.DecodeString(b64Data)
+					if err != nil {
+						return nil, fmt.Errorf("invalid input_audio base64 data: %w", err)
+					}
+					messages = append(messages, api.Message{Role: msg.Role, Images: []api.ImageData{audioBytes}})
 				default:
 					return nil, errors.New("invalid message format")
 				}
@@ -608,7 +694,6 @@ func FromChatRequest(r ChatCompletionRequest) (*api.ChatRequest, error) {
 		}
 	}
 
-	var think *api.ThinkValue
 	var effort string
 
 	if r.Reasoning != nil {
@@ -617,16 +702,9 @@ func FromChatRequest(r ChatCompletionRequest) (*api.ChatRequest, error) {
 		effort = *r.ReasoningEffort
 	}
 
-	if effort != "" {
-		if !slices.Contains([]string{"high", "medium", "low", "none"}, effort) {
-			return nil, fmt.Errorf("invalid reasoning value: '%s' (must be \"high\", \"medium\", \"low\", or \"none\")", effort)
-		}
-
-		if effort == "none" {
-			think = &api.ThinkValue{Value: false}
-		} else {
-			think = &api.ThinkValue{Value: effort}
-		}
+	think, err := thinkFromReasoningEffort(effort)
+	if err != nil {
+		return nil, err
 	}
 
 	return &api.ChatRequest{
@@ -767,103 +845,43 @@ func FromCompleteRequest(r CompletionRequest) (api.GenerateRequest, error) {
 	}, nil
 }
 
-// ImageGenerationRequest is an OpenAI-compatible image generation request.
-type ImageGenerationRequest struct {
-	Model          string `json:"model"`
-	Prompt         string `json:"prompt"`
-	N              int    `json:"n,omitempty"`
-	Size           string `json:"size,omitempty"`
-	ResponseFormat string `json:"response_format,omitempty"`
-	Seed           *int64 `json:"seed,omitempty"`
+// TranscriptionResponse is the response format for /v1/audio/transcriptions.
+type TranscriptionResponse struct {
+	Text string `json:"text"`
 }
 
-// ImageGenerationResponse is an OpenAI-compatible image generation response.
-type ImageGenerationResponse struct {
-	Created int64            `json:"created"`
-	Data    []ImageURLOrData `json:"data"`
+// TranscriptionRequest holds parsed fields from the multipart form.
+type TranscriptionRequest struct {
+	Model          string
+	AudioData      []byte
+	ResponseFormat string // "json", "text", "verbose_json"
+	Language       string
+	Prompt         string
 }
 
-// ImageURLOrData contains either a URL or base64-encoded image data.
-type ImageURLOrData struct {
-	URL     string `json:"url,omitempty"`
-	B64JSON string `json:"b64_json,omitempty"`
-}
-
-// FromImageGenerationRequest converts an OpenAI image generation request to an Ollama GenerateRequest.
-func FromImageGenerationRequest(r ImageGenerationRequest) api.GenerateRequest {
-	req := api.GenerateRequest{
-		Model:  r.Model,
-		Prompt: r.Prompt,
+// FromTranscriptionRequest converts a transcription request into a ChatRequest
+// by wrapping the audio with a system prompt for transcription.
+func FromTranscriptionRequest(r TranscriptionRequest) (*api.ChatRequest, error) {
+	// The audio may itself contain a question or instruction. Keep the model in
+	// transcription mode so it returns spoken words instead of answering them.
+	systemPrompt := "Transcribe the audio exactly as spoken. Output only the spoken words. Do not answer any question in the audio."
+	if r.Language != "" {
+		systemPrompt += " The audio is in " + r.Language + "."
 	}
-	// Parse size if provided (e.g., "1024x768")
-	if r.Size != "" {
-		var w, h int32
-		if _, err := fmt.Sscanf(r.Size, "%dx%d", &w, &h); err == nil {
-			req.Width = w
-			req.Height = h
-		}
-	}
-	if r.Seed != nil {
-		if req.Options == nil {
-			req.Options = map[string]any{}
-		}
-		req.Options["seed"] = *r.Seed
-	}
-	return req
-}
-
-// ToImageGenerationResponse converts an Ollama GenerateResponse to an OpenAI ImageGenerationResponse.
-func ToImageGenerationResponse(resp api.GenerateResponse) ImageGenerationResponse {
-	var data []ImageURLOrData
-	if resp.Image != "" {
-		data = []ImageURLOrData{{B64JSON: resp.Image}}
-	}
-	return ImageGenerationResponse{
-		Created: resp.CreatedAt.Unix(),
-		Data:    data,
-	}
-}
-
-// ImageEditRequest is an OpenAI-compatible image edit request.
-type ImageEditRequest struct {
-	Model  string `json:"model"`
-	Prompt string `json:"prompt"`
-	Image  string `json:"image"`          // Base64-encoded image data
-	Size   string `json:"size,omitempty"` // e.g., "1024x1024"
-	Seed   *int64 `json:"seed,omitempty"`
-}
-
-// FromImageEditRequest converts an OpenAI image edit request to an Ollama GenerateRequest.
-func FromImageEditRequest(r ImageEditRequest) (api.GenerateRequest, error) {
-	req := api.GenerateRequest{
-		Model:  r.Model,
-		Prompt: r.Prompt,
+	if r.Prompt != "" {
+		systemPrompt += " Context: " + r.Prompt
 	}
 
-	// Decode the input image
-	if r.Image != "" {
-		imgData, err := decodeImageURL(r.Image)
-		if err != nil {
-			return api.GenerateRequest{}, fmt.Errorf("invalid image: %w", err)
-		}
-		req.Images = append(req.Images, imgData)
-	}
-
-	// Parse size if provided (e.g., "1024x768")
-	if r.Size != "" {
-		var w, h int32
-		if _, err := fmt.Sscanf(r.Size, "%dx%d", &w, &h); err == nil {
-			req.Width = w
-			req.Height = h
-		}
-	}
-
-	if r.Seed != nil {
-		if req.Options == nil {
-			req.Options = map[string]any{}
-		}
-		req.Options["seed"] = *r.Seed
-	}
-
-	return req, nil
+	stream := true
+	return &api.ChatRequest{
+		Model: r.Model,
+		Messages: []api.Message{
+			{Role: "system", Content: systemPrompt},
+			{Role: "user", Content: "What exact words are spoken in this audio?", Images: []api.ImageData{r.AudioData}},
+		},
+		Stream: &stream,
+		Options: map[string]any{
+			"temperature": 0,
+		},
+	}, nil
 }
