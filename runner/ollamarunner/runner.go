@@ -362,6 +362,13 @@ type batchState struct {
 
 	// Signaled when this batches outputs are complete and the next batch can proceed
 	outputsReadyCh chan struct{}
+
+	// poolCount is the number of unique embeddingOnly sequences contributing
+	// pooled outputs to this batch. With pooling (e.g. LLAMA_POOLING_TYPE_RANK
+	// for rerank), the model emits one output per sequence, not per token
+	// position — so output slicing for embeddings is by pool index, not by the
+	// per-token batchOutputs index used by token sampling.
+	poolCount int
 }
 
 type Server struct {
@@ -623,11 +630,25 @@ func (s *Server) forwardBatch(pendingBatch batchState) (nextBatch batchState, er
 			batch.Positions = append(batch.Positions, int32(len(seq.cache.Inputs)+len(seq.pendingInputs)))
 			batch.Sequences = append(batch.Sequences, seq.cache.Id)
 
-			seq.iBatch = len(batchOutputs)
-			if i+1 == len(seq.inputs) || seq.embeddingOnly {
+			if seq.embeddingOnly {
+				// Pooled output: one entry per unique seq in the batch.
+				// Assign seq.iBatch as the pool index on this seq's first
+				// contribution to the batch; reuse it on subsequent token
+				// positions. The pool order matches the order seqs first
+				// appear in batch.Sequences, which is what the pooling layer
+				// (lastPositionPerSequence) gathers in.
+				if len(seq.pendingInputs) == 0 {
+					seq.iBatch = nextBatch.poolCount
+					nextBatch.poolCount++
+				}
 				batchOutputs = append(batchOutputs, int32(len(batchInputs)-1))
+			} else {
+				seq.iBatch = len(batchOutputs)
+				if i+1 == len(seq.inputs) {
+					batchOutputs = append(batchOutputs, int32(len(batchInputs)-1))
+				}
 			}
-			logutil.Trace("forwardBatch iBatch", "batchID", s.batchID, "seqIdx", seqIdx, "seq.iBatch", seq.iBatch, "i+1", i+1, "len(seq.inputs)", len(seq.inputs))
+			logutil.Trace("forwardBatch iBatch", "batchID", s.batchID, "seqIdx", seqIdx, "seq.iBatch", seq.iBatch, "i+1", i+1, "len(seq.inputs)", len(seq.inputs), "poolCount", nextBatch.poolCount)
 			seq.pendingInputs = append(seq.pendingInputs, inp)
 		}
 
@@ -784,9 +805,25 @@ func (s *Server) computeBatch(activeBatch batchState) {
 			seq.startedAt = seq.lastUpdatedAt
 		}
 
-		// if done processing the prompt, generate an embedding and return
+		// If done processing the prompt, slice this seq's pooled output out of
+		// the batch's flat output buffer. With sequence-aware pooling (TypeRank
+		// in ml/nn/pooling), the model emits one entry per unique embeddingOnly
+		// seq in the batch (count = activeBatch.poolCount). seq.iBatch is the
+		// pool index for this seq, set in forwardBatch.
 		if seq.embeddingOnly {
-			seq.embedding <- outputs
+			embDim := 1
+			if activeBatch.poolCount > 0 {
+				embDim = len(outputs) / activeBatch.poolCount
+			}
+			if embDim < 1 {
+				embDim = 1
+			}
+			start := seq.iBatch * embDim
+			end := start + embDim
+			if end > len(outputs) {
+				end = len(outputs)
+			}
+			seq.embedding <- outputs[start:end]
 			s.removeSequence(i, llm.DoneReasonStop)
 			continue
 		}

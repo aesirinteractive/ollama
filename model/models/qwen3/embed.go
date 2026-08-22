@@ -26,8 +26,15 @@ func (m *embedModel) Forward(ctx ml.Context, batch input.Batch) (ml.Tensor, erro
 		return nil, err
 	}
 
-	hiddenStates = m.poolingType.Forward(ctx, hiddenStates, nil, m.ClsOut)
+	hiddenStates = m.poolingType.Forward(ctx, hiddenStates, batch.Sequences, nil, m.ClsOut)
 	if m.poolingType == pooling.TypeRank {
+		// Qwen3-Reranker's cls head emits two logits per seq: [logit_no, logit_yes].
+		// Softmax gives [prob_no, prob_yes]. The rerank handler in the runner
+		// picks the LAST element of each seq's embedding slice (see ollamarunner
+		// rerank handler), which is prob_yes for Qwen3 (2-class output) and the
+		// single logit for BGE-style 1-class output. This avoids slicing here
+		// entirely — slicing the innermost dim has subtle view-materialization
+		// issues with ggml's Floats().
 		hiddenStates = hiddenStates.Softmax(ctx)
 	} else {
 		hiddenStates = hiddenStates.L2Norm(ctx, 1e-12)

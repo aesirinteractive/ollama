@@ -7483,7 +7483,8 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
             } break;
         case LLM_ARCH_MODERN_BERT:
             {
-                llm = std::make_unique<llm_build_modern_bert<true>>(*this, params);
+                // llm = std::make_unique<llm_build_modern_bert<true>>(*this, params);
+                GGML_ABORT("LLM_ARCH_MODERN_BERT not supported in this build");
             } break;
         case LLM_ARCH_NEO_BERT:
             {
@@ -7576,11 +7577,12 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
             } break;
         case LLM_ARCH_PLAMO3:
             {
-                if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
-                    llm = std::make_unique<llm_build_plamo3<true>> (*this, params);
-                } else {
-                    llm = std::make_unique<llm_build_plamo3<false>>(*this, params);
-                }
+                // if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+                //     llm = std::make_unique<llm_build_plamo3<true>> (*this, params);
+                // } else {
+                //     llm = std::make_unique<llm_build_plamo3<false>>(*this, params);
+                // }
+                GGML_ABORT("LLM_ARCH_PLAMO3 not supported in this build");
             } break;
         case LLM_ARCH_GPT2:
             {
@@ -7888,7 +7890,8 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
             } break;
         case LLM_ARCH_MIMO2:
             {
-                llm = std::make_unique<llm_build_mimo2_iswa>(*this, params);
+                // llm = std::make_unique<llm_build_mimo2_iswa>(*this, params);
+                GGML_ABORT("LLM_ARCH_MIMO2 not supported in this build");
             } break;
         default:
             GGML_ABORT("fatal error");

@@ -852,7 +852,8 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
             } break;
         case PROJECTOR_TYPE_LFM2A:
             {
-                builder = std::make_unique<clip_graph_conformer>(ctx, img);
+                // builder = std::make_unique<clip_graph_conformer>(ctx, img);
+                GGML_ABORT("PROJECTOR_TYPE_LFM2A (conformer) not supported in this build");
             } break;
         case PROJECTOR_TYPE_GLM4V:
             {

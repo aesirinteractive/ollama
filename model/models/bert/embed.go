@@ -39,7 +39,7 @@ func (m *Model) Forward(ctx ml.Context, batch input.Batch) (ml.Tensor, error) {
 		hiddenStates = layer.Forward(ctx, hiddenStates, &m.Options)
 	}
 
-	hiddenStates = m.poolingType.Forward(ctx, hiddenStates, m.Cls, m.ClsOut)
+	hiddenStates = m.poolingType.Forward(ctx, hiddenStates, batch.Sequences, m.Cls, m.ClsOut)
 	if m.normalize && m.poolingType != pooling.TypeRank {
 		hiddenStates = hiddenStates.L2Norm(ctx, 1e-12)
 	}
