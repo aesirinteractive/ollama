@@ -868,22 +868,9 @@ func (s *Server) RerankHandler(c *gin.Context) {
 		llmReq.Prompts = req.Documents
 	}
 	err = r.Rerank(c.Request.Context(), llmReq, func(rr llm.RerankResponse) {
-		// Convention normalization across reranker model families:
-		//   - BGE-style cross-encoders return an unbounded logit per seq where
-		//     higher = more relevant (any range, often [-15, +15]).
-		//   - Qwen3-Reranker returns a probability in [0, 1] after softmax,
-		//     where lower = more relevant (it's prob_no for the "yes" class).
-		//
-		// We detect by score range: any score strictly in (0, 1) is treated as
-		// a probability and inverted to "higher = more relevant" via 1 - score.
-		// BGE logits almost always fall outside (0, 1); the rare case where one
-		// does land there is harmless because |large logits| dominate ranking.
-		for i := range rr.Results {
-			s := rr.Results[i].RelevanceScore
-			if s > 0 && s < 1 {
-				rr.Results[i].RelevanceScore = 1.0 - s
-			}
-		}
+		// Scores pass through untouched: llama-server's /v1/rerank guarantees
+		// higher = more relevant for every model family (BGE-style logits,
+		// Qwen3-style sigmoid probabilities, ...).
 		sort.SliceStable(rr.Results, func(i, j int) bool {
 			return rr.Results[i].RelevanceScore > rr.Results[j].RelevanceScore
 		})
