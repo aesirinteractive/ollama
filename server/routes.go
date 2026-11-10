@@ -21,7 +21,6 @@ import (
 	"os"
 	"os/signal"
 	"slices"
-	"sort"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -892,122 +891,6 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 	}
 
 	streamResponse(c, ch)
-}
-
-func (s *Server) RerankHandler(c *gin.Context) {
-	var req api.RerankRequest
-	if err := c.ShouldBindJSON(&req); errors.Is(err, io.EOF) {
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "missing request body"})
-		return
-	} else if err != nil {
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	switch {
-	case len(req.Documents) == 0:
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "Document cannot be empty"})
-		return
-	case req.Query == "":
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "Query cannot be empty"})
-		return
-	case req.TopN < 0:
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "TopN cannot be negative"})
-		return
-	}
-	ref, err := parseAndValidateModelRef(req.Model)
-	if err != nil {
-		if errors.Is(err, errModelRequired) {
-			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-			return
-		}
-		writeModelRefParseError(c, err, http.StatusNotFound, fmt.Sprintf("model '%s' not found", req.Model))
-		return
-	}
-	if ref.Source == modelSourceCloud {
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "rerank requires a local model"})
-		return
-	}
-	mm, err := s.getExistingModelForRunner(ref.Name.String(), "")
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("model '%s' not found", req.Model)})
-			return
-		}
-		handleScheduleError(c, req.Model, err)
-		return
-	}
-	if req.Options == nil {
-		req.Options = make(map[string]any)
-	}
-	req.Options["reranking"] = true
-	r, m, _, err := s.scheduleRunnerForModel(c.Request.Context(), mm, []model.Capability{}, req.Options, req.KeepAlive, nil)
-	if err != nil {
-		handleScheduleError(c, req.Model, err)
-		return
-	}
-	llmReq := llm.RerankRequest{
-		Model: req.Model,
-	}
-	useTemplate := false
-	if m.Template != nil {
-		vars, err := m.Template.Vars()
-		if err != nil {
-			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-			return
-		}
-		useTemplate = slices.Contains(vars, "query") && slices.Contains(vars, "document")
-	}
-	if useTemplate {
-		for _, doc := range req.Documents {
-			var b bytes.Buffer
-			var values template.Values
-			values.Query = req.Query
-			values.Document = doc
-			if err := m.Template.Execute(&b, values); err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-				return
-			}
-			llmReq.Prompts = append(llmReq.Prompts, b.String())
-		}
-	} else {
-		llmReq.Query = &req.Query
-		llmReq.Prompts = req.Documents
-	}
-	err = r.Rerank(c.Request.Context(), llmReq, func(rr llm.RerankResponse) {
-		// Scores pass through untouched: llama-server's /v1/rerank guarantees
-		// higher = more relevant for every model family (BGE-style logits,
-		// Qwen3-style sigmoid probabilities, ...).
-		sort.SliceStable(rr.Results, func(i, j int) bool {
-			return rr.Results[i].RelevanceScore > rr.Results[j].RelevanceScore
-		})
-
-		var topn int
-		if req.TopN == 0 {
-			topn = len(rr.Results) // if TopN is unset, return all results
-		} else {
-			topn = min(len(rr.Results), req.TopN)
-		}
-		topResults := rr.Results[:topn]
-
-		rsp := api.RerankResponse{
-			Model:   req.Model,
-			Results: make([]api.RerankResult, topn),
-		}
-
-		for i, result := range topResults {
-			rsp.Results[i].Index = result.Index
-			rsp.Results[i].RelevanceScore = result.RelevanceScore
-		}
-
-		c.JSON(http.StatusOK, rsp)
-	})
-
-	if err != nil {
-		slog.Info(fmt.Sprintf("rerank failed: %v", err))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to rerank"})
-		return
-	}
 }
 
 func (s *Server) systemOneLlamaServer(c *gin.Context, m *Model, req decision.Request, body []byte) {
